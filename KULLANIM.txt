@@ -1,0 +1,28 @@
+SOYLU MAKİNE – PRES KAPASİTE HESAPLAMA
+======================================
+
+KURULUM (.exe yapmak için, bir kere)
+1. Bilgisayarda Python 3.10+ kurulu olsun (python.org, kurulumda "Add to PATH" işaretli).
+2. Bu klasördeki build_exe.bat dosyasına çift tıklayın.
+3. Bitince dist\KapasiteHesaplama.exe oluşur. Bu exe'yi istediğiniz yere kopyalayabilirsiniz;
+   Python kurulu olmayan bilgisayarlarda da çalışır.
+
+Denemek için exe yapmadan:  python app.py
+
+KULLANIM
+1. "Plan dosyası" ve "Operasyon dosyası"nı seçin, sayfa adlarını kontrol edin, "Verileri Yükle".
+2. Soldan hesaplanacak ayları işaretleyip "Hesapla".
+3. Sekmeler:
+   - Makine Yükü : Makine bazında aylık saat, kapasite ve doluluk %.
+                   Turuncu = %85–100, Kırmızı = %100 üstü (darboğaz). Başlığa tıklayınca sıralar.
+   - Grafik      : Yük çubukları + siyah çizgi kapasite. Dönem seçilebilir.
+   - Simülasyon  : Darboğaz makine, hedef alternatif ve oran seçip "Simüle Et".
+                   Önce/sonra karşılaştırması gösterilir.
+   - Kapasite    : Her makinenin AYLIK kullanılabilir saatini girin, "Kaydet ve Yeniden Hesapla".
+                   Ayarlar exe'nin yanındaki kapasite_ayarlari.json dosyasında saklanır.
+   - Eşleşmeyenler: Planda olup operasyon dosyasında bulunmayan referanslar (saatleri hesaba katılmaz).
+4. "Excel'e Aktar": Özet (haftalık detaylı), son simülasyon, eşleşmeyenler ve tüm detaylar.
+
+NOTLAR
+- Toplam saat ve doluluk % backlog'u içermez; backlog ayrı sütunda gösterilir.
+- Simülasyonda aktarılan iş, alternatif makinede de aynı saniyeyle hesaplanır.
