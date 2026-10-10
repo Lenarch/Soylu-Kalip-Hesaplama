@@ -1,6 +1,7 @@
 pandas
 numpy
 openpyxl
+xlrd
 matplotlib
 customtkinter
 pyinstaller

@@ -10,19 +10,29 @@ KURULUM (.exe yapmak için, bir kere)
 Denemek için exe yapmadan:  python app.py
 
 KULLANIM
-1. "Plan dosyası" ve "Operasyon dosyası"nı seçin, sayfa adlarını kontrol edin, "Verileri Yükle".
+1. "Veritabanı" kutusunda kapasite.db seçili olsun (yoksa "Yeni DB oluştur").
+   Plan Excel'ini "Excel'den Aktar" ile yükleyin, sonra "Verileri Yükle".
+   Ayrıntı: VERITABANI.txt. Yükleme geçmişi ve geri alma: "Aktarımlar" sekmesi.
 2. Soldan hesaplanacak ayları işaretleyip "Hesapla".
 3. Sekmeler:
-   - Makine Yükü : Makine bazında aylık saat, kapasite ve doluluk %.
+   - Makine Yükü : Makine bazında saat, kapasite ve doluluk %. "Aylık / Haftalık" görünüm seçilebilir.
                    Turuncu = %85–100, Kırmızı = %100 üstü (darboğaz). Başlığa tıklayınca sıralar.
-   - Grafik      : Yük çubukları + siyah çizgi kapasite. Dönem seçilebilir.
+   - Grafik      : Yük çubukları + siyah çizgi kapasite. Dönem: seçili aylar, tek ay veya tek hafta.
    - Simülasyon  : Darboğaz makine, hedef alternatif ve oran seçip "Simüle Et".
                    Önce/sonra karşılaştırması gösterilir.
-   - Kapasite    : Her makinenin AYLIK kullanılabilir saatini girin, "Kaydet ve Yeniden Hesapla".
+   - Kapasite    : Her makinenin HAFTALIK kullanılabilir saatini girin, "Kaydet ve Yeniden Hesapla".
+                   Ay kapasitesi = haftalık kapasite × o ayın planda kaç haftası varsa.
                    Ayarlar exe'nin yanındaki kapasite_ayarlari.json dosyasında saklanır.
-   - Eşleşmeyenler: Planda olup operasyon dosyasında bulunmayan referanslar (saatleri hesaba katılmaz).
+   - Operasyonlar: REFERANS PRES şablonundaki operasyon listesi (ürün, pres, alternatifler, saniye).
+                   İlk sefer "Excel'den Al…" ile REFERANS PRES dosyasından alınır; sonra Yeni Satır /
+                   Düzenle (çift tık) / Sil / Tümünü Sil ile uygulamada yönetilir.
+                   Değişiklikler "Kaydet"e basılana kadar veritabanına yazılmaz; "Vazgeç" veya
+                   kaydetmeden kapatmak tüm değişiklikleri iptal eder. Kırmızı satır: pres veya saniye boş.
+   - Eşleşmeyenler: Siparişi olup operasyonlar tablosunda bulunmayan referanslar (saatleri hesaba katılmaz).
 4. "Excel'e Aktar": Özet (haftalık detaylı), son simülasyon, eşleşmeyenler ve tüm detaylar.
 
 NOTLAR
 - Toplam saat ve doluluk % backlog'u içermez; backlog ayrı sütunda gösterilir.
+- Stok backlog'dan fazlaysa: Güncel Backlog 0 sayılır, artan stok aynı ürünün siparişlerinden tarih
+  sırasıyla düşülür ("Stoktan karşılanan (saat)" sütunu). Bu yüzden toplam saat ve doluluk da azalır.
 - Simülasyonda aktarılan iş, alternatif makinede de aynı saniyeyle hesaplanır.
