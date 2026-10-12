@@ -9,15 +9,19 @@ backlog      : Ürün + firma bazında, AY AY backlog ve stok adetleri
 operasyonlar : Ürünün operasyonları, presi, alternatifleri, parça başı saniye
 urunler      : (İsteğe bağlı) ürün açıklaması
 
-Kural: Aynı yıl + ay için birden fazla yükleme varsa EN SON (geri alınmamış) yükleme geçerlidir.
-Eski yüklemeler silinmez; son yükleme geri alınırsa bir öncekisi tekrar geçerli olur.
+Kural (her yıl + ay için):
+  - 'yerine' yükleme: o ayın önceki yüklemelerinin yerine geçer (aynı dosyanın güncel hali).
+  - 'ekle' yükleme  : o ayın üstüne eklenir (ör. başka müşterinin dosyası).
+  Geçerli = en son aktif 'yerine' yükleme + ondan sonraki aktif 'ekle' yüklemeleri.
+  Aynı ürün + firma + hafta birden fazla geçerli yüklemede varsa en yenisi alınır.
+Eski yüklemeler silinmez; geri alınan yükleme hesaptan çıkar, öncekiler tekrar geçerli olur.
 aktarim_id'si boş (NULL) satırlar elle girilmiş kabul edilir ve her zaman geçerlidir.
 """
 import os
 import sqlite3
 from datetime import datetime
 
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS aktarimlar (
@@ -33,7 +37,9 @@ CREATE TABLE IF NOT EXISTS aktarimlar (
     backlog_satir INTEGER NOT NULL DEFAULT 0,
     durum         TEXT NOT NULL DEFAULT 'aktif'  -- aktif / geri alındı
         CHECK (durum IN ('aktif', 'geri alındı')),
-    geri_alma_tarihi TEXT
+    geri_alma_tarihi TEXT,
+    mod           TEXT NOT NULL DEFAULT 'yerine' -- yerine: aynı ayın öncekilerin yerine geçer
+        CHECK (mod IN ('yerine', 'ekle'))        -- ekle  : aynı ayın üstüne eklenir (başka müşteri dosyası)
 );
 
 CREATE TABLE IF NOT EXISTS siparisler (
@@ -50,6 +56,7 @@ CREATE TABLE IF NOT EXISTS siparisler (
 );
 CREATE INDEX IF NOT EXISTS ix_siparisler_aktarim ON siparisler(aktarim_id);
 CREATE INDEX IF NOT EXISTS ix_siparisler_urun ON siparisler(urun_kodu);
+CREATE INDEX IF NOT EXISTS ix_siparisler_anahtar ON siparisler(urun_kodu, firma, yil, hafta);
 
 CREATE TABLE IF NOT EXISTS backlog (
     id            INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -63,6 +70,7 @@ CREATE TABLE IF NOT EXISTS backlog (
     UNIQUE (aktarim_id, urun_kodu, firma, yil, ay)
 );
 CREATE INDEX IF NOT EXISTS ix_backlog_aktarim ON backlog(aktarim_id);
+CREATE INDEX IF NOT EXISTS ix_backlog_anahtar ON backlog(urun_kodu, firma, yil, ay);
 
 CREATE TABLE IF NOT EXISTS operasyonlar (
     id                   INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -84,20 +92,39 @@ CREATE TABLE IF NOT EXISTS urunler (
     aciklama    TEXT
 );
 
--- Hesapta kullanılan (geçerli) yüklemeler: her yıl + ay için en son aktif yükleme
-CREATE VIEW IF NOT EXISTS gecerli_aktarimlar AS
+"""
+
+# Görünümler her açılışta yeniden kurulur (veri tutmazlar).
+SCHEMA_VIEWS = """
+DROP VIEW IF EXISTS gecerli_backlog;
+DROP VIEW IF EXISTS gecerli_siparisler;
+DROP VIEW IF EXISTS gecerli_aktarimlar;
+
+-- Hesapta kullanılan yüklemeler (her yıl + ay için):
+--   en son aktif 'yerine' yükleme + ondan SONRA gelen aktif 'ekle' yüklemeleri
+CREATE VIEW gecerli_aktarimlar AS
 SELECT a.* FROM aktarimlar a
 WHERE a.durum = 'aktif'
-  AND a.id = (SELECT MAX(b.id) FROM aktarimlar b
-              WHERE b.durum = 'aktif' AND b.yil = a.yil AND b.ay = a.ay);
+  AND a.id >= COALESCE((SELECT MAX(b.id) FROM aktarimlar b
+                        WHERE b.durum = 'aktif' AND b.yil = a.yil AND b.ay = a.ay
+                          AND b.mod = 'yerine'), 0);
 
-CREATE VIEW IF NOT EXISTS gecerli_siparisler AS
+-- Aynı ürün + firma + hafta birden fazla geçerli yüklemede varsa EN YENİSİ alınır (çift sayım olmaz)
+CREATE VIEW gecerli_siparisler AS
 SELECT s.* FROM siparisler s
-WHERE s.aktarim_id IS NULL OR s.aktarim_id IN (SELECT id FROM gecerli_aktarimlar);
+WHERE s.aktarim_id IS NULL
+   OR s.aktarim_id = (SELECT MAX(s2.aktarim_id) FROM siparisler s2
+                      WHERE s2.aktarim_id IN (SELECT id FROM gecerli_aktarimlar)
+                        AND s2.urun_kodu = s.urun_kodu AND s2.firma = s.firma
+                        AND s2.yil = s.yil AND s2.hafta = s.hafta);
 
-CREATE VIEW IF NOT EXISTS gecerli_backlog AS
+CREATE VIEW gecerli_backlog AS
 SELECT k.* FROM backlog k
-WHERE k.aktarim_id IS NULL OR k.aktarim_id IN (SELECT id FROM gecerli_aktarimlar);
+WHERE k.aktarim_id IS NULL
+   OR k.aktarim_id = (SELECT MAX(k2.aktarim_id) FROM backlog k2
+                      WHERE k2.aktarim_id IN (SELECT id FROM gecerli_aktarimlar)
+                        AND k2.urun_kodu = k.urun_kodu AND k2.firma = k.firma
+                        AND k2.yil = k.yil AND k2.ay = k.ay);
 """
 
 
@@ -115,7 +142,8 @@ HAFTA_YILI_SQL = ("CASE WHEN ay='ARALIK' AND hafta<10 THEN yil+1 "
 
 
 def connect(path: str) -> sqlite3.Connection:
-    con = sqlite3.connect(path)
+    # timeout: dosya kısa süre kilitliyse (ör. OneDrive senkronu) hemen hata vermek yerine 15 sn bekle
+    con = sqlite3.connect(path, timeout=15)
     con.execute("PRAGMA foreign_keys = ON")
     return con
 
@@ -156,11 +184,21 @@ def create_empty_db(path: str) -> str:
         if "hafta_yili" not in _columns(con, "siparisler"):
             con.execute("ALTER TABLE siparisler ADD COLUMN hafta_yili INTEGER")
         con.execute(f"UPDATE siparisler SET hafta_yili = {HAFTA_YILI_SQL} WHERE hafta_yili IS NULL")
+        # önceki sürümde 'mod' yoktu: eski yüklemeler 'yerine' sayılır
+        if "mod" not in _columns(con, "aktarimlar"):
+            con.execute("ALTER TABLE aktarimlar ADD COLUMN mod TEXT NOT NULL DEFAULT 'yerine'")
+        con.executescript(SCHEMA_VIEWS)
         con.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
         con.commit()
     finally:
         con.close()
     return path
+
+
+def is_synced_folder(path: str) -> bool:
+    """Veritabanı OneDrive / Dropbox / Google Drive gibi senkron klasöründe mi?"""
+    p = os.path.abspath(path).replace("\\", "/").lower()
+    return any(k in p for k in ("/onedrive", "/dropbox", "/google drive", "/googledrive", "/icloud"))
 
 
 def ensure_schema(path: str):
@@ -227,18 +265,77 @@ def save_operations(path: str, df) -> int:
     return len(rows)
 
 
+# ----------------------------------------------------------------------
+# Siparişler penceresi: hesaptaki siparişleri görme ve elle düzenleme
+# ----------------------------------------------------------------------
+AY_ADLARI = ["OCAK", "ŞUBAT", "MART", "NİSAN", "MAYIS", "HAZİRAN",
+             "TEMMUZ", "AĞUSTOS", "EYLÜL", "EKİM", "KASIM", "ARALIK"]
+MANUAL_FILE = "Elle düzenleme"
+
+
+def load_valid_orders(path: str):
+    """Hesapta kullanılan siparişler (adet > 0), kaynağıyla birlikte."""
+    import pandas as pd
+    create_empty_db(path)
+    con = connect(path)
+    try:
+        df = pd.read_sql_query("""
+            SELECT s.urun_kodu, s.firma, s.yil, s.ay, s.hafta, s.hafta_yili, s.adet, s.aktarim_id,
+                   COALESCE(a.dosya_adi, 'elle girilmiş') AS kaynak, COALESCE(a.tarih, '') AS tarih
+            FROM gecerli_siparisler s LEFT JOIN aktarimlar a ON a.id = s.aktarim_id
+            WHERE s.adet > 0""", con)
+    finally:
+        con.close()
+    df["firma"] = df["firma"].fillna("")
+    return df
+
+
+def save_manual_orders(path: str, changes, aciklama: str = "") -> list:
+    """Elle yapılan sipariş değişikliklerini yazar. changes: [{urun_kodu, firma, yil, ay, hafta, adet}, ...]
+    adet = 0 -> sipariş silinir (hesaptan çıkar). Her yıl + ay için bir 'Elle düzenleme' yüklemesi (mod='ekle')
+    oluşturulur; Aktarımlar sekmesinden geri alınabilir. Tek işlem: hata olursa hiçbiri yazılmaz."""
+    from collections import defaultdict
+    create_empty_db(path)
+    groups = defaultdict(list)
+    for c in changes:
+        groups[(int(c["yil"]), c["ay"])].append(c)
+    now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    ids = []
+    con = connect(path)
+    try:
+        with con:
+            for (yil, ay), rows in sorted(groups.items(), key=lambda kv: (kv[0][0], AY_ADLARI.index(kv[0][1]))):
+                ay_no = AY_ADLARI.index(ay) + 1
+                cur = con.execute(
+                    "INSERT INTO aktarimlar(tarih, dosya_adi, sayfa, yil, ay, ay_no, haftalar, siparis_satir, "
+                    "backlog_satir, mod) VALUES (?,?,?,?,?,?,?,?,0,'ekle')",
+                    (now, MANUAL_FILE, aciklama or None, yil, ay, ay_no,
+                     ",".join(str(h) for h in sorted({int(r["hafta"]) for r in rows})),
+                     sum(1 for r in rows if float(r["adet"]) > 0)))
+                aid = cur.lastrowid
+                con.executemany(
+                    "INSERT INTO siparisler(aktarim_id, urun_kodu, firma, yil, hafta, hafta_yili, ay, adet) "
+                    "VALUES (?,?,?,?,?,?,?,?)",
+                    [(aid, r["urun_kodu"], r.get("firma") or "", yil, int(r["hafta"]),
+                      hafta_yili(yil, ay_no, int(r["hafta"])), ay, float(r["adet"])) for r in rows])
+                ids.append(aid)
+    finally:
+        con.close()
+    return ids
+
+
 def list_imports(path: str):
     """Tüm yüklemeler, en yeni en üstte. 'gecerli' = hesapta kullanılıyor mu."""
     con = connect(path)
     try:
         rows = con.execute("""
             SELECT a.id, a.tarih, a.dosya_adi, a.sayfa, a.yil, a.ay, a.haftalar,
-                   a.siparis_satir, a.backlog_satir, a.durum,
+                   a.siparis_satir, a.backlog_satir, a.durum, a.mod,
                    CASE WHEN g.id IS NULL THEN 0 ELSE 1 END AS gecerli
             FROM aktarimlar a LEFT JOIN gecerli_aktarimlar g ON g.id = a.id
             ORDER BY a.id DESC""").fetchall()
         cols = ["id", "tarih", "dosya_adi", "sayfa", "yil", "ay", "haftalar",
-                "siparis_satir", "backlog_satir", "durum", "gecerli"]
+                "siparis_satir", "backlog_satir", "durum", "mod", "gecerli"]
         return [dict(zip(cols, r)) for r in rows]
     finally:
         con.close()

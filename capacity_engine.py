@@ -7,7 +7,8 @@ from typing import List, Optional, Dict, Tuple
 
 
 def normalize_code(value) -> str:
-    """[DÜZELTME 1] Ürün kodunu tek tip metne çevirir: 12345.0 -> '12345', NaN -> ''."""
+    """Ürün kodunu tek tip metne çevirir: 12345.0 -> '12345', NaN -> '', '1011240t' -> '1011240T'.
+    Büyük harfe çevrilir; böylece büyük/küçük harf farkı eşleşmeyi bozmaz."""
     if pd.isna(value):
         return ""
     if isinstance(value, float) and value.is_integer():
@@ -15,7 +16,8 @@ def normalize_code(value) -> str:
     s = str(value).strip()
     if re.fullmatch(r"\d+\.0+", s):
         s = s.split(".")[0]
-    if s.upper() in ("NAN", "NONE"):
+    s = s.upper()
+    if s in ("NAN", "NONE"):
         return ""
     return s
 

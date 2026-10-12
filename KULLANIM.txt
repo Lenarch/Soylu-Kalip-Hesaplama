@@ -23,11 +23,16 @@ KULLANIM
    - Kapasite    : Her makinenin HAFTALIK kullanılabilir saatini girin, "Kaydet ve Yeniden Hesapla".
                    Ay kapasitesi = haftalık kapasite × o ayın planda kaç haftası varsa.
                    Ayarlar exe'nin yanındaki kapasite_ayarlari.json dosyasında saklanır.
-   - Operasyonlar: REFERANS PRES şablonundaki operasyon listesi (ürün, pres, alternatifler, saniye).
+   - Operasyonlar (üstteki düğme, ayrı pencere): REFERANS PRES şablonundaki operasyon listesi.
                    İlk sefer "Excel'den Al…" ile REFERANS PRES dosyasından alınır; sonra Yeni Satır /
                    Düzenle (çift tık) / Sil / Tümünü Sil ile uygulamada yönetilir.
                    Değişiklikler "Kaydet"e basılana kadar veritabanına yazılmaz; "Vazgeç" veya
-                   kaydetmeden kapatmak tüm değişiklikleri iptal eder. Kırmızı satır: pres veya saniye boş.
+                   pencereyi kaydetmeden kapatmak tüm değişiklikleri iptal eder. Kırmızı satır: pres veya saniye boş.
+   - Siparişler (üstteki düğme, ayrı pencere): hesaptaki siparişler (ay, hafta, firma, ürün, adet).
+                   Yeni Sipariş / Adet Değiştir (çift tık) / Sil. Ay ve ürün/firma ile süzülebilir.
+                   "Kaydet"e kadar taslakta kalır; kayıt Aktarımlar'da "Elle düzenleme" olarak görünür
+                   ve oradan "Geri Al" ile geri alınabilir. Silinen sipariş yok edilmez, 0 yapılır.
+                   Not: o ayın tam Excel'i sonradan "Yerine geçsin" ile yüklenirse elle düzenlemelerin yerine geçer.
    - Eşleşmeyenler: Siparişi olup operasyonlar tablosunda bulunmayan referanslar (saatleri hesaba katılmaz).
 4. "Excel'e Aktar": Özet (haftalık detaylı), son simülasyon, eşleşmeyenler ve tüm detaylar.
 

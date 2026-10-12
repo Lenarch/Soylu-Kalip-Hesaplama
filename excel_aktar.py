@@ -158,16 +158,22 @@ def parse_plan(path: str, sheet: str) -> ParsedPlan:
     data = raw.iloc[hdr + 1:]
     num = lambda v: pd.to_numeric(v, errors="coerce")
     orders, backlog, refs = [], [], set()
+    not_codes = []   # ürün kodu sütununda kod olmayan değerler (ör. firma adı)
     for _, row in data.iterrows():
         ref = normalize_code(row.iloc[c_ref])
         if not ref or "TOPLAM" in fold(ref):
+            continue
+        if not re.search(r"\d", ref):
+            # Ürün kodlarında en az bir rakam olur. Rakamsız değer (ör. "VALEO BREZİLYA") büyük ihtimalle
+            # sayfanın altında farklı düzende duran başka bir bloktur -> okunmaz.
+            not_codes.append(ref)
             continue
         firma = str(row.iloc[c_firma]).strip() if c_firma is not None and pd.notna(row.iloc[c_firma]) else ""
         refs.add((ref, firma))
         for bi, b in enumerate(block_list):
             for col, hafta in b.weeks.items():
                 q = num(row.iloc[col])
-                if pd.notna(q) and q != 0:
+                if pd.notna(q):   # açıkça yazılmış 0 da tutulur ('üstüne ekle'de eski değeri sıfırlamak için)
                     if q < 0:
                         warnings.append(f"{ref} W{hafta}: negatif adet ({q:g}) atlandı.")
                         continue
@@ -194,9 +200,14 @@ def parse_plan(path: str, sheet: str) -> ParsedPlan:
             "Dosya Excel'de hiç açılıp kaydedilmemiş olabilir (başka bir programla oluşturulmuş dosyalarda olur).\n\n"
             "Çözüm: dosyayı Excel'de açın, Kaydet (Ctrl+S) deyin, kapatıp tekrar aktarın.\n"
             "Bu haliyle aktarılsaydı bu hücreler 0 sayılırdı; o yüzden hiçbir şey yazılmadı.")
-    if not orders:
+    if not any(o[4] > 0 for o in orders):
         warnings.append("Dosyada hiç sipariş adedi bulunamadı (tüm hafta hücreleri boş veya 0).")
 
+    if not_codes:
+        uniq = list(dict.fromkeys(not_codes))
+        warnings.insert(0, f"{len(not_codes)} satır atlandı: REFERANS sütunundaki değer ürün kodu gibi görünmüyor "
+                           f"(ör. {', '.join(uniq[:4])}). Sayfada farklı düzende bir blok olabilir; doğru sayfayı "
+                           "seçtiğinizden emin olun (tüm müşteriler için 'Diğer müşteriler DAHİL').")
     orders = pd.DataFrame(orders, columns=["urun_kodu", "firma", "blok", "hafta", "adet"])
     orders = orders.groupby(["urun_kodu", "firma", "blok", "hafta"], as_index=False)["adet"].sum()
     backlog = pd.DataFrame(backlog, columns=["urun_kodu", "firma", "backlog_adet", "stok_adet"])
@@ -231,7 +242,25 @@ def _uncached_formulas(path, sheet, raw, hdr, c_ref, cols) -> List[str]:
         wb.close()
 
 
-def check_conflicts(db_path: str, plan: ParsedPlan, years: Dict[int, int]) -> List[str]:
+def week_month_problem(hafta: int, hafta_yil: int, ay_no: int, ay_yil: int) -> Optional[str]:
+    """Haftanın gerçek tarihleri ile yazıldığı ay uyuşmuyorsa açıklama döner, uyuşuyorsa None.
+    Haftanın en az bir günü o ayda ise uyumlu sayılır (ay geçişindeki haftalar iki ayda da olabilir)."""
+    from datetime import date, timedelta
+    try:
+        monday = date.fromisocalendar(hafta_yil, hafta, 1)
+    except ValueError:
+        return f"W{hafta}: {hafta_yil} yılında {hafta}. hafta yok (o yıl {date(hafta_yil, 12, 28).isocalendar()[1]} hafta)."
+    days = [monday + timedelta(d) for d in range(7)]
+    if any(d.year == ay_yil and d.month == ay_no for d in days):
+        return None
+    adlar = ["Ocak", "Şubat", "Mart", "Nisan", "Mayıs", "Haziran", "Temmuz", "Ağustos", "Eylül", "Ekim",
+             "Kasım", "Aralık"]
+    fmt = lambda d: f"{d.day} {adlar[d.month - 1]} {d.year}"
+    return (f"W{hafta} ({fmt(days[0])} – {fmt(days[-1])}) {AYLAR[ay_no - 1]} {ay_yil} altına yazılmış; "
+            "tarihler bu aya denk gelmiyor. Yazım hatası olabilir.")
+
+
+def check_conflicts(db_path: str, plan: ParsedPlan, years: Dict[int, int], mod: str = "yerine") -> List[str]:
     """Yüklemeden önce bilgi: aynı ay daha önce yüklenmiş mi, haftalar başka ayda var mı."""
     if not os.path.exists(db_path):
         return []
@@ -241,13 +270,22 @@ def check_conflicts(db_path: str, plan: ParsedPlan, years: Dict[int, int]) -> Li
     try:
         for bi, b in enumerate(plan.blocks):
             yil = years[bi]
-            r = con.execute("SELECT id, tarih, dosya_adi FROM gecerli_aktarimlar WHERE yil=? AND ay=?",
-                            (yil, b.ay)).fetchone()
-            if r:
-                msgs.append(f"{b.ay} {yil} daha önce yüklenmiş ({r[1]}, {r[2]}). Yeni yükleme geçerli olacak; "
-                            "eskisi geçmişte kalır, istenirse geri alınabilir.")
+            rows = con.execute("SELECT id, tarih, dosya_adi FROM gecerli_aktarimlar WHERE yil=? AND ay=? "
+                               "ORDER BY id", (yil, b.ay)).fetchall()
+            if rows:
+                dosyalar = ", ".join(sorted({r[2] for r in rows}))
+                if mod == "ekle":
+                    msgs.append(f"{b.ay} {yil} için hesapta zaten veri var ({dosyalar}). Bu dosya ÜSTÜNE EKLENECEK; "
+                                "aynı ürün + firma + hafta iki dosyada da varsa bu dosyadaki değer geçerli olur.")
+                else:
+                    msgs.append(f"{b.ay} {yil} için hesapta zaten veri var ({dosyalar}). Bu dosya onların YERİNE "
+                                "GEÇECEK (eskiler geçmişte kalır, geri alınabilir). Başka bir müşterinin dosyasıysa "
+                                "'Üstüne eklensin'i seçin.")
             for hafta in sorted(set(b.weeks.values())):
                 hy = hafta_yili(yil, b.ay_no, hafta)
+                problem = week_month_problem(hafta, hy, b.ay_no, yil)
+                if problem:
+                    msgs.append(problem)
                 o = con.execute("SELECT DISTINCT ay || ' ' || yil FROM gecerli_siparisler "
                                 "WHERE hafta_yili=? AND hafta=? AND NOT (ay=? AND yil=?)",
                                 (hy, hafta, b.ay, yil)).fetchall()
@@ -259,7 +297,7 @@ def check_conflicts(db_path: str, plan: ParsedPlan, years: Dict[int, int]) -> Li
     return msgs
 
 
-def import_plan(db_path: str, plan: ParsedPlan, years: Dict[int, int]) -> List[int]:
+def import_plan(db_path: str, plan: ParsedPlan, years: Dict[int, int], mod: str = "yerine") -> List[int]:
     """Her ay bloğunu ayrı bir yükleme (işlem kaydı) olarak yazar. Tek işlem: hata olursa hiçbiri yazılmaz."""
     for bi, b in enumerate(plan.blocks):
         y = years.get(bi)
@@ -274,12 +312,15 @@ def import_plan(db_path: str, plan: ParsedPlan, years: Dict[int, int]) -> List[i
             for bi, b in enumerate(plan.blocks):
                 yil = years[bi]
                 o = plan.orders[plan.orders["blok"] == bi]
+                if mod != "ekle":
+                    o = o[o["adet"] > 0]   # 'yerine'de 0'lar gereksiz (o ayın tamamı zaten bu dosya)
                 bl = plan.backlog if bi == 0 else plan.backlog.iloc[0:0]
                 cur = con.execute(
-                    "INSERT INTO aktarimlar(tarih, dosya_adi, sayfa, yil, ay, ay_no, haftalar, siparis_satir, backlog_satir) "
-                    "VALUES (?,?,?,?,?,?,?,?,?)",
+                    "INSERT INTO aktarimlar(tarih, dosya_adi, sayfa, yil, ay, ay_no, haftalar, siparis_satir, "
+                    "backlog_satir, mod) VALUES (?,?,?,?,?,?,?,?,?,?)",
                     (now, os.path.basename(plan.path), plan.sheet, yil, b.ay, b.ay_no,
-                     ",".join(str(h) for h in sorted(set(b.weeks.values()))), len(o), len(bl)))
+                     ",".join(str(h) for h in sorted(set(b.weeks.values()))), int((o["adet"] > 0).sum()), len(bl),
+                     "ekle" if mod == "ekle" else "yerine"))
                 aid = cur.lastrowid
                 con.executemany(
                     "INSERT INTO siparisler(aktarim_id, urun_kodu, firma, yil, hafta, hafta_yili, ay, adet) "

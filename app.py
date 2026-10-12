@@ -3,6 +3,7 @@ Soylu Makine - Pres Kapasite Hesaplama Uygulaması
 Arayüz: CustomTkinter  |  Hesap motoru: capacity_engine.py
 """
 import json
+from datetime import datetime
 import re
 import os
 import sys
@@ -18,10 +19,13 @@ matplotlib.use("TkAgg")
 from matplotlib.figure import Figure
 from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg, NavigationToolbar2Tk
 
-from capacity_engine import CapacityEngine, normalize_machine
-from veritabani import (create_empty_db, table_counts, list_imports, undo_import,
-                        load_operations, save_operations, OP_COLUMNS)
-from excel_aktar import sheet_names, parse_plan, check_conflicts, import_plan, parse_operations, OP_SHEET_DEFAULT, fold
+from capacity_engine import CapacityEngine, normalize_machine, normalize_code
+from veritabani import (create_empty_db, table_counts, list_imports, undo_import, is_synced_folder,
+                        load_operations, save_operations, OP_COLUMNS,
+                        load_valid_orders, save_manual_orders, AY_ADLARI)
+from excel_aktar import (sheet_names, parse_plan, check_conflicts, import_plan, parse_operations, OP_SHEET_DEFAULT,
+                         fold, week_month_problem)
+from veritabani import hafta_yili
 
 APP_TITLE = "Soylu Makine – Pres Kapasite Hesaplama"
 DEFAULT_DB_NAME = "kapasite.db"
@@ -33,6 +37,7 @@ WEEKS_PER_MONTH = 52 / 12      # eski aylık ayarları çevirmek için
 ALL_PERIOD = "Seçili aylar toplamı"
 
 COLOR_OK = "#2e9d5b"
+COLOR_WARN_TEXT = "#b25e00"
 COLOR_WARN = "#e8a33d"
 COLOR_OVER = "#d64545"
 COLOR_BEFORE = "#9aa5b1"
@@ -49,6 +54,30 @@ def app_dir() -> str:
 
 
 SETTINGS_FILE = os.path.join(app_dir(), "kapasite_ayarlari.json")
+ICON_FILE = "soylu_kapasite.ico"
+
+
+def resource_path(name: str) -> str:
+    """Exe içine gömülen dosyanın yolu (PyInstaller) ya da script klasöründeki dosya."""
+    base = getattr(sys, "_MEIPASS", os.path.dirname(os.path.abspath(__file__)))
+    return os.path.join(base, name)
+
+
+def set_icon(win):
+    """Pencere / görev çubuğu simgesi. CustomTkinter kendi simgesini ~200 ms sonra koyduğu için biraz sonra uygulanır."""
+    path = resource_path(ICON_FILE)
+    if not os.path.exists(path):
+        return
+    def apply():
+        try:
+            win.iconbitmap(path)
+        except Exception:
+            pass
+    apply()
+    try:
+        win.after(300, apply)
+    except Exception:
+        pass
 
 
 def load_settings() -> dict:
@@ -164,6 +193,8 @@ class DataTable(ctk.CTkFrame):
     def clear(self):
         self.tree.delete(*self.tree.get_children())
         self.tree["columns"] = []
+        self._df = None           # başlığa tıklanınca eski veri geri gelmesin
+        self._total_row = None
 
 
 # ----------------------------------------------------------------------
@@ -249,17 +280,16 @@ class App(ctk.CTk):
         ctk.set_appearance_mode("light")
         ctk.set_default_color_theme("blue")
         self.title(APP_TITLE)
+        set_icon(self)
         self.geometry("1350x820")
         self.minsize(1100, 680)
 
         self.report_callback_exception = self._show_exception
-        self.protocol("WM_DELETE_WINDOW", self._on_close)
-        self.ops_draft = pd.DataFrame(columns=OP_COLUMNS)   # Operasyonlar sekmesindeki taslak
-        self.ops_dirty = False
         self.settings = load_settings()
         self.engine: CapacityEngine = None
         self.summary: pd.DataFrame = None       # kapasite eklenmiş güncel özet
         self.sim_result: pd.DataFrame = None    # son simülasyon karşılaştırması
+        self.sim_key = None                      # simülasyonun yapıldığı aylar / kapasite
         self.month_vars = {}
         self.cap_entries = {}
 
@@ -278,23 +308,6 @@ class App(ctk.CTk):
         self.db_entry.insert(0, db)
         self._show_db_info()
         self._refresh_imports()
-        self._ops_reload()
-
-    def _on_close(self):
-        if self.ops_dirty and not messagebox.askyesno(
-                "Kaydedilmemiş değişiklik",
-                "Operasyonlar sekmesinde kaydedilmemiş değişiklikler var.\n\n"
-                "Kaydetmeden çıkılsın mı? (Değişiklikler iptal olur)"):
-            return
-        self.destroy()
-
-    def _confirm_discard_ops(self) -> bool:
-        """Taslakta kaydedilmemiş değişiklik varsa kullanıcıya sorar. True = devam edilebilir."""
-        if not self.ops_dirty:
-            return True
-        return messagebox.askyesno("Kaydedilmemiş değişiklik",
-                                   "Operasyonlar sekmesinde kaydedilmemiş değişiklikler var.\n"
-                                   "Devam edilirse bu değişiklikler iptal olacak. Devam edilsin mi?")
 
     def _show_exception(self, exc_type, exc, tb):
         text = "".join(traceback.format_exception(exc_type, exc, tb))
@@ -318,20 +331,43 @@ class App(ctk.CTk):
         ctk.CTkButton(bar, text="Seç…", width=70, command=self._pick_db).grid(row=0, column=2, padx=6, pady=(10, 2))
         ctk.CTkButton(bar, text="Yeni DB oluştur", width=130, fg_color="gray55",
                       command=self._new_db).grid(row=0, column=3, padx=6, pady=(10, 2))
+        ctk.CTkButton(bar, text="Operasyonlar", width=120, fg_color="gray55",
+                      command=self._open_ops).grid(row=0, column=4, padx=6, pady=(10, 2))
+        ctk.CTkButton(bar, text="Siparişler", width=110, fg_color="gray55",
+                      command=self._open_orders).grid(row=0, column=5, padx=6, pady=(10, 2))
 
         self.db_info = ctk.CTkLabel(bar, text="", anchor="w", text_color="#555")
-        self.db_info.grid(row=1, column=1, columnspan=3, sticky="w", pady=(0, 8))
+        self.db_info.grid(row=1, column=1, columnspan=5, sticky="w", pady=(0, 8))
 
         self.import_btn = ctk.CTkButton(bar, text="Excel'den Aktar", height=56, width=140,
                                         fg_color=COLOR_OK, hover_color="#24804a",
                                         font=ctk.CTkFont(size=13, weight="bold"), command=self._open_import)
-        self.import_btn.grid(row=0, column=4, rowspan=2, padx=(10, 4), pady=8)
+        self.import_btn.grid(row=0, column=6, rowspan=2, padx=(10, 4), pady=8)
         self.load_btn = ctk.CTkButton(bar, text="Verileri Yükle", height=56, width=150,
                                       font=ctk.CTkFont(size=14, weight="bold"), command=self._load_data)
-        self.load_btn.grid(row=0, column=5, rowspan=2, padx=(4, 10), pady=8)
+        self.load_btn.grid(row=0, column=7, rowspan=2, padx=(4, 10), pady=8)
 
         self.status = ctk.CTkLabel(self, text="", anchor="w", text_color="#555")
         self.status.pack(side="bottom", fill="x", padx=14, pady=(0, 6))
+
+    def _open_ops(self):
+        db = self._db_path()
+        if not db:
+            messagebox.showwarning("Eksik", "Önce bir veritabanı seçin veya 'Yeni DB oluştur'.")
+            return
+        if not os.path.exists(db):
+            if not messagebox.askyesno("Veritabanı yok", f"{db}\nbulunamadı. Boş veritabanı oluşturulsun mu?"):
+                return
+            create_empty_db(db)
+            self._show_db_info()
+        OpsWindow(self, db)
+
+    def _open_orders(self):
+        db = self._db_path()
+        if not db or not os.path.exists(db):
+            messagebox.showwarning("Veritabanı yok", "Önce bir veritabanı seçin ve plan Excel'ini aktarın.")
+            return
+        OrdersWindow(self, db)
 
     def _db_path(self) -> str:
         return self.db_entry.get().strip()
@@ -347,22 +383,24 @@ class App(ctk.CTk):
             self.db_info.configure(text=f"Veritabanı okunamadı: {e}")
             return
         parts = [f"{t}: {'tablo yok' if n is None else n}" for t, n in c.items()]
-        self.db_info.configure(text="Kayıt sayıları →  " + "   |   ".join(parts))
+        text = "Kayıt sayıları →  " + "   |   ".join(parts)
+        if is_synced_folder(path):
+            # OneDrive vb. SQLite dosyasını senkron sırasında kilitleyebilir / çakışma kopyası oluşturabilir
+            text += ("\n⚠ Veritabanı OneDrive (senkron) klasöründe: kilitlenme veya kayıt kaybı riski var. "
+                     "OneDrive dışında bir klasöre (ör. C:\\SoyluKapasite) taşımanız önerilir.")
+            self.db_info.configure(text=text, text_color=COLOR_WARN_TEXT, justify="left")
+        else:
+            self.db_info.configure(text=text, text_color="#555", justify="left")
 
     def _pick_db(self):
-        if not self._confirm_discard_ops():
-            return
         path = filedialog.askopenfilename(filetypes=[("SQLite veritabanı", "*.db *.sqlite *.sqlite3"), ("Tümü", "*.*")])
         if path:
             self.db_entry.delete(0, "end")
             self.db_entry.insert(0, path)
             self._show_db_info()
             self._refresh_imports()
-            self._ops_reload()
 
     def _new_db(self):
-        if not self._confirm_discard_ops():
-            return
         path = filedialog.asksaveasfilename(defaultextension=".db", initialfile=DEFAULT_DB_NAME,
                                             filetypes=[("SQLite veritabanı", "*.db")])
         if not path:
@@ -380,7 +418,6 @@ class App(ctk.CTk):
                                       if existed else "Boş veritabanı oluşturuldu.") +
                             "\n\nPlan Excel'lerini 'Excel'den Aktar' ile yükleyebilirsiniz.")
         self._refresh_imports()
-        self._ops_reload()
 
     # ---------------- Excel'den aktarma ----------------
     def _open_import(self):
@@ -422,10 +459,11 @@ class App(ctk.CTk):
             "Sipariş satırı": str(r["siparis_satir"]), "Backlog satırı": str(r["backlog_satir"]),
             "Durum": ("HESAPTA" if r["gecerli"] else
                       "geri alındı" if r["durum"] != "aktif" else "eski (yenisi var)"),
+            "Tür": "üstüne eklendi" if r.get("mod") == "ekle" else "yerine geçti",
         } for r in rows])
         n_valid = sum(r["gecerli"] for r in rows)
         self.imports_label.configure(text=f"{len(rows)} yükleme, {n_valid} tanesi hesapta. "
-                                          "Aynı ay için en son yükleme geçerlidir.")
+                                          "'Yerine geçti': o ayın öncekilerin yerine geçer. 'Üstüne eklendi': o aya eklenir.")
         self.imports_table.show(df, tag_func=lambda r: "" if r["Durum"] == "HESAPTA" else "warn")
 
     def _undo_selected(self):
@@ -489,7 +527,7 @@ class App(ctk.CTk):
     def _build_tabs(self):
         self.tabs = ctk.CTkTabview(self.body)
         self.tabs.pack(side="left", fill="both", expand=True)
-        for name in ("Makine Yükü", "Grafik", "Simülasyon", "Kapasite", "Operasyonlar", "Eşleşmeyenler", "Aktarımlar"):
+        for name in ("Makine Yükü", "Grafik", "Simülasyon", "Kapasite", "Eşleşmeyenler", "Aktarımlar"):
             self.tabs.add(name)
 
         # Makine yükü
@@ -523,8 +561,6 @@ class App(ctk.CTk):
 
         self._build_sim_tab()
         self._build_capacity_tab()
-
-        self._build_ops_tab()
 
         # Aktarımlar (işlem kaydı)
         t = self.tabs.tab("Aktarımlar")
@@ -637,6 +673,7 @@ class App(ctk.CTk):
 
     def _on_loaded_inner(self, eng: CapacityEngine, db):
         self.engine = eng
+        self._clear_results()
         self.load_btn.configure(state="normal", text="Verileri Yükle")
         self.settings["db_file"] = db
         save_settings(self.settings)
@@ -662,8 +699,12 @@ class App(ctk.CTk):
         # Eşleşmeyenler
         self._show_unmapped()
 
+        has_data = bool(eng.available_months)
         for b in (self.calc_btn, self.export_btn, self.sim_btn):
-            b.configure(state="normal")
+            b.configure(state="normal" if has_data else "disabled")
+        if not has_data:
+            self.load_chart.message("Veritabanında geçerli sipariş yok – 'Excel'den Aktar' ile plan yükleyin.")
+            ctk.CTkLabel(self.month_frame, text="(sipariş yok)", text_color="#888").pack()
 
         n_plan = len(eng.df_plan)
         n_unm = eng.unmapped_df[eng.ref_col].nunique() if eng.unmapped_df is not None else 0
@@ -709,6 +750,8 @@ class App(ctk.CTk):
             return float(self.settings.get("default_weekly_capacity", 0))
 
     def _build_capacity_rows(self, machines):
+        # Kutulara yazılmış ama henüz kaydedilmemiş değerler yeniden yüklemede kaybolmasın
+        typed = {m: e.get() for m, e in self.cap_entries.items()}
         for w in self.cap_frame.winfo_children():
             w.destroy()
         self.cap_entries = {}
@@ -718,8 +761,9 @@ class App(ctk.CTk):
         for i, m in enumerate(machines, start=1):
             ctk.CTkLabel(self.cap_frame, text=m, width=140, anchor="w").grid(row=i, column=0, padx=10, pady=2, sticky="w")
             e = ctk.CTkEntry(self.cap_frame, width=110, placeholder_text=fmt_input(self._default_cap()))
-            if m in caps:
-                e.insert(0, fmt_input(caps[m]))
+            val = typed[m] if m in typed else (fmt_input(caps[m]) if m in caps else "")
+            if val:
+                e.insert(0, val)
             e.grid(row=i, column=1, padx=10, pady=2)
             self.cap_entries[m] = e
 
@@ -885,11 +929,15 @@ class App(ctk.CTk):
             f"(aktarılabilir). Hedef makineler: {', '.join(targets) if targets else '—'}"))
 
     def _run_simulation(self):
-        if self.engine is None or self.summary is None:
+        if self.engine is None:
             return
         months = self._selected_months()
         if not months:
             messagebox.showwarning("Ay seçilmedi", "En az bir ay seçin.")
+            return
+        # "Önce" ve "Sonra" aynı ay seçimiyle hesaplansın: önce güncel seçimle normal hesabı yenile
+        self._recalculate()
+        if self.summary is None:
             return
         machine, alt, pct = self.sim_machine.get(), self.sim_alt.get(), float(self.sim_pct.get())
         try:
@@ -922,6 +970,8 @@ class App(ctk.CTk):
         changed = view[view["Fark (saat)"].abs() > 1e-9].sort_values("Fark (saat)")
         self.sim_result = view.copy()
         self.sim_result.insert(0, "Senaryo", f"{machine} → {alt} %{pct:.0f}")
+        self.sim_result.insert(1, "Aylar", ", ".join(months))
+        self.sim_key = self._sim_key(months)
 
         if changed.empty:
             self.sim_chart.message(f"{machine} için '{alt}' tanımlı iş yok – değişiklik olmadı.")
@@ -936,6 +986,24 @@ class App(ctk.CTk):
         self._set_status(f"Simülasyon: {machine} makinesinden {fmt_num(moved)} saat aktarıldı.")
 
     # ---------------- Excel ----------------
+    def _sim_key(self, months):
+        """Simülasyonun geçerli olduğu koşullar: aylar + kapasite ayarları + yüklü veri."""
+        caps, default_cap = self.settings.get("weekly_capacities", {}), self._default_cap()
+        return (tuple(months), json.dumps(caps, sort_keys=True), default_cap, id(self.engine))
+
+    def _clear_results(self):
+        """Veri yeniden yüklenince eski hesap / simülasyon sonuçlarını ekrandan ve hafızadan temizle."""
+        self.summary = None
+        self.sim_result = None
+        self.sim_key = None
+        self.load_table.clear()
+        self.load_chart.message("Gösterilecek veri yok.")
+        self.sim_table.clear()
+        self.sim_chart.message("Makine, hedef ve oranı seçip 'Simüle Et'e basın.")
+        self.period_weeks = {}
+        self.period_combo.configure(values=[ALL_PERIOD])
+        self.period_combo.set(ALL_PERIOD)
+
     def _export(self):
         if self.engine is None:
             return
@@ -948,7 +1016,14 @@ class App(ctk.CTk):
         if not path:
             return
         caps, default_cap = self._capacity_args()
-        extra = {"Simülasyon": self.sim_result} if self.sim_result is not None else None
+        # Son simülasyon sadece şu anki aylar + kapasiteyle yapıldıysa rapora girer
+        extra, note = None, ""
+        if self.sim_result is not None:
+            if getattr(self, "sim_key", None) == self._sim_key(months):
+                extra = {"Simülasyon": self.sim_result}
+            else:
+                note = ("\n\nNot: son simülasyon farklı ay / kapasite ile yapıldığı için rapora eklenmedi. "
+                        "Rapora girmesi için 'Simüle Et'e tekrar basın.")
         try:
             self.engine.export_to_excel(path, months, caps, default_cap, extra_sheets=extra)
         except PermissionError:
@@ -958,16 +1033,67 @@ class App(ctk.CTk):
             messagebox.showerror("Hata", f"{type(e).__name__}: {e}")
             return
         self._set_status(f"Rapor kaydedildi: {path}")
-        if messagebox.askyesno("Tamam", "Rapor kaydedildi. Şimdi açılsın mı?"):
+        if messagebox.askyesno("Tamam", "Rapor kaydedildi." + note + "\n\nŞimdi açılsın mı?"):
             try:
                 os.startfile(path)  # Windows
             except Exception:
                 pass
 
 
-    # ---------------- Operasyonlar (REFERANS PRES) ----------------
-    def _build_ops_tab(self):
-        t = self.tabs.tab("Operasyonlar")
+def bring_to_front(win):
+    """Yeni açılan pencere ana pencerenin arkasında kalmasın (Windows'ta CTkToplevel bilinen sorunu)."""
+    try:
+        win.lift()
+        win.focus_force()
+        win.after(200, win.lift)
+        set_icon(win)
+    except Exception:
+        pass
+
+
+def op_keys(df: pd.DataFrame) -> pd.Series:
+    """Operasyon satırının kimliği: ürün + operasyon stok kodu (büyük/küçük harf farkı yok).
+    Operasyon kodu boşsa ürün + pres + saniye kullanılır."""
+    u = df["urun_kodu"].astype(str).str.strip().str.upper()
+    o = df["operasyon_stok_kodu"].astype(str).str.strip().str.upper()
+    p = df["uretim_presi"].astype(str).str.strip().str.upper()
+    sn = pd.to_numeric(df["uretim_saniye"], errors="coerce").fillna(0).round(4).astype(str)
+    return pd.Series(np.where(o != "", u + "|" + o, u + "||" + p + "|" + sn), index=df.index)
+
+
+def duplicate_rows(df: pd.DataFrame) -> pd.Series:
+    """Listede birden fazla kez geçen operasyon satırları (True = tekrar)."""
+    if df.empty:
+        return pd.Series(False, index=df.index)
+    return op_keys(df).duplicated(keep=False)
+
+
+class _Parented:
+    """messagebox / filedialog pencerelerini verilen pencerenin önünde açar."""
+    def __init__(self, mod, parent):
+        self.mod, self.parent = mod, parent
+
+    def __getattr__(self, name):
+        f = getattr(self.mod, name)
+        return lambda *a, **k: f(*a, parent=self.parent, **k)
+
+
+class OpsWindow(ctk.CTkToplevel):
+    """Operasyonlar (REFERANS PRES) penceresi. Değişiklikler 'Kaydet'e kadar taslakta kalır."""
+
+    def __init__(self, app, db_path):
+        super().__init__(app)
+        self.app, self.db_path = app, db_path
+        self.title(f"Operasyonlar – {os.path.basename(db_path)}")
+        self.geometry("1300x700")
+        self.transient(app)
+        self.grab_set()
+        self.protocol("WM_DELETE_WINDOW", self._close)
+        bring_to_front(self)
+        self.ops_draft = pd.DataFrame(columns=OP_COLUMNS)
+        self.ops_dirty = False
+        t = ctk.CTkFrame(self, fg_color="transparent")
+        t.pack(fill="both", expand=True, padx=10, pady=10)
         bar = ctk.CTkFrame(t, fg_color="transparent")
         bar.pack(fill="x", pady=(0, 4))
         ctk.CTkButton(bar, text="Excel'den Al…", width=110, fg_color=COLOR_OK, hover_color="#24804a",
@@ -993,15 +1119,24 @@ class App(ctk.CTk):
         self.ops_table.pack(fill="both", expand=True)
         self.ops_table.tree.bind("<Double-1>", lambda _: self._ops_edit())
         self.ops_table.tree.bind("<Delete>", lambda _: self._ops_delete())
+        self._ops_reload()
+
+    def _close(self):
+        if self.ops_dirty and not _Parented(messagebox, self).askyesno(
+                "Kaydedilmemiş değişiklik",
+                "Kaydedilmemiş değişiklikler var.\n\nKaydetmeden kapatılsın mı? (Değişiklikler iptal olur)"):
+            return
+        self.grab_release()
+        self.destroy()
 
     def _ops_reload(self):
         """Taslağı veritabanından yeniden okur (kaydedilmemiş değişiklikler gider)."""
-        db = self._db_path()
+        db = self.db_path
         try:
             self.ops_draft = load_operations(db) if db and os.path.exists(db) else pd.DataFrame(columns=OP_COLUMNS)
         except Exception as e:
             self.ops_draft = pd.DataFrame(columns=OP_COLUMNS)
-            messagebox.showerror("Hata", f"Operasyonlar okunamadı:\n{e}")
+            _Parented(messagebox, self).showerror("Hata", f"Operasyonlar okunamadı:\n{e}")
         self.ops_draft = self.ops_draft.reset_index(drop=True)
         self._ops_set_dirty(False)
 
@@ -1031,12 +1166,17 @@ class App(ctk.CTk):
             text = view.drop(columns=["#"]).astype(str).apply(lambda col: col.map(fold)).agg(" ".join, axis=1)
             view = view[text.str.contains(re.escape(q), regex=True)]
         badset = set(df.index[bad].astype(str))
-        self.ops_table.show(view.reset_index(drop=True), tag_func=lambda r: "over" if r["#"] in badset else "")
+        dup = duplicate_rows(df)
+        dupset = set(df.index[dup].astype(str))
+        self.ops_table.show(view.reset_index(drop=True),
+                            tag_func=lambda r: "over" if r["#"] in badset else ("warn" if r["#"] in dupset else ""))
         info = f"{len(df)} operasyon satırı, {df['urun_kodu'].nunique()} ürün"
         if q:
             info += f"  |  aramada {len(view)} satır"
         if bad.any():
             info += f"  |  {int(bad.sum())} satırda eksik bilgi (kırmızı: pres veya saniye boş)"
+        if dup.any():
+            info += f"  |  {int(dup.sum())} satır TEKRAR EDİYOR (turuncu) – saatler fazla sayılır"
         if self.ops_dirty:
             info += "   ●  KAYDEDİLMEMİŞ DEĞİŞİKLİK VAR – 'Kaydet' demeden hesaba yansımaz"
         self.ops_label.configure(text=info, text_color=COLOR_OVER if self.ops_dirty else "#333")
@@ -1055,12 +1195,22 @@ class App(ctk.CTk):
     def _ops_edit(self):
         sel = self._ops_selected()
         if len(sel) != 1:
-            messagebox.showinfo("Seçim", "Düzenlemek için listeden tek bir satır seçin (veya çift tıklayın).")
+            _Parented(messagebox, self).showinfo("Seçim", "Düzenlemek için listeden tek bir satır seçin (veya çift tıklayın).")
             return
         OpDialog(self, self.ops_draft.loc[sel[0]].to_dict(), self._ops_machine_names(),
                  lambda rec: self._ops_store(rec, sel[0]))
 
     def _ops_store(self, rec, idx=None):
+        """Satırı taslağa yazar. Aynı ürün + operasyon zaten varsa yazmaz, hata metni döner."""
+        others = self.ops_draft if idx is None else self.ops_draft.drop(index=idx)
+        if not others.empty:
+            key = op_keys(pd.DataFrame([rec], columns=OP_COLUMNS)).iloc[0]
+            hit = others.index[op_keys(others) == key]
+            if len(hit):
+                return (f"Bu ürün + operasyon zaten listede var (satır #{hit[0]}): "
+                        f"{rec['urun_kodu']} / {rec['operasyon_stok_kodu'] or '(operasyon kodu boş)'}.\n\n"
+                        "Aynı operasyon iki kez olursa saatleri iki kez sayılır. "
+                        "Mevcut satırı düzenleyin veya farklı bir operasyon kodu girin.")
         if idx is None:
             self.ops_draft = pd.concat([self.ops_draft, pd.DataFrame([rec], columns=OP_COLUMNS)], ignore_index=True)
         else:
@@ -1071,9 +1221,9 @@ class App(ctk.CTk):
     def _ops_delete(self):
         sel = self._ops_selected()
         if not sel:
-            messagebox.showinfo("Seçim", "Silmek için listeden satır seçin (Ctrl / Shift ile birden fazla seçilebilir).")
+            _Parented(messagebox, self).showinfo("Seçim", "Silmek için listeden satır seçin (Ctrl / Shift ile birden fazla seçilebilir).")
             return
-        if not messagebox.askyesno("Sil", f"{len(sel)} satır silinsin mi?\n(Kaydet'e basana kadar geri alınabilir: Vazgeç)"):
+        if not _Parented(messagebox, self).askyesno("Sil", f"{len(sel)} satır silinsin mi?\n(Kaydet'e basana kadar geri alınabilir: Vazgeç)"):
             return
         self.ops_draft = self.ops_draft.drop(index=sel).reset_index(drop=True)
         self._ops_set_dirty(True)
@@ -1081,47 +1231,63 @@ class App(ctk.CTk):
     def _ops_delete_all(self):
         if self.ops_draft.empty:
             return
-        if not messagebox.askyesno("Tümünü sil", f"{len(self.ops_draft)} satırın TAMAMI silinsin mi?\n"
+        if not _Parented(messagebox, self).askyesno("Tümünü sil", f"{len(self.ops_draft)} satırın TAMAMI silinsin mi?\n"
                                                  "(Kaydet'e basana kadar geri alınabilir: Vazgeç)"):
             return
         self.ops_draft = pd.DataFrame(columns=OP_COLUMNS)
         self._ops_set_dirty(True)
 
     def _ops_cancel(self):
-        if messagebox.askyesno("Vazgeç", "Kaydedilmemiş tüm değişiklikler iptal edilsin mi?"):
+        if _Parented(messagebox, self).askyesno("Vazgeç", "Kaydedilmemiş tüm değişiklikler iptal edilsin mi?"):
             self._ops_reload()
 
     def _ops_save(self):
-        db = self._db_path()
+        db = self.db_path
         if not db:
-            messagebox.showwarning("Eksik", "Önce bir veritabanı seçin.")
+            _Parented(messagebox, self).showwarning("Eksik", "Önce bir veritabanı seçin.")
             return
+        dup = duplicate_rows(self.ops_draft)
+        if dup.any():
+            keys = op_keys(self.ops_draft)
+            extra = int(keys.duplicated(keep="first").sum())
+            ornek = self.ops_draft[dup].drop_duplicates(["urun_kodu", "operasyon_stok_kodu"]).head(8)
+            liste = "\n".join(f"  {r.urun_kodu} / {r.operasyon_stok_kodu or '-'}" for r in ornek.itertuples())
+            ans = _Parented(messagebox, self).askyesnocancel(
+                "Tekrar eden operasyonlar",
+                f"Listede aynı ürün + operasyon {extra} kez fazladan geçiyor (turuncu satırlar), ör.:\n{liste}\n\n"
+                "Bu haliyle kaydedilirse bu işlerin saatleri birden fazla sayılır.\n\n"
+                "EVET = tekrarları silip (ilkini tutarak) kaydet\nHAYIR = olduğu gibi kaydet\nİPTAL = vazgeç")
+            if ans is None:
+                return
+            if ans:
+                self.ops_draft = self.ops_draft[~keys.duplicated(keep="first")].reset_index(drop=True)
+                self._ops_show()
         bad = int(((self.ops_draft["uretim_presi"].astype(str).str.strip() == "") |
                    (pd.to_numeric(self.ops_draft["uretim_saniye"], errors="coerce").fillna(0) <= 0)).sum())
         msg = f"{len(self.ops_draft)} operasyon satırı veritabanına kaydedilecek (eski liste bununla değişir)."
         if bad:
             msg += f"\n\n{bad} satırda pres veya saniye boş; bu satırlar saate çevrilemez."
-        if not messagebox.askyesno("Kaydet", msg + "\n\nKaydedilsin mi?"):
+        if not _Parented(messagebox, self).askyesno("Kaydet", msg + "\n\nKaydedilsin mi?"):
             return
         try:
             n = save_operations(db, self.ops_draft)
         except Exception as e:
-            messagebox.showerror("Kaydedilemedi", f"Hiçbir şey değişmedi.\n\n{type(e).__name__}: {e}")
+            _Parented(messagebox, self).showerror("Kaydedilemedi", f"Hiçbir şey değişmedi.\n\n{type(e).__name__}: {e}")
             return
         self._ops_reload()
-        self._show_db_info()
-        self._set_status(f"{n} operasyon satırı kaydedildi.")
-        self._load_data()
+        self.app._show_db_info()
+        self.app._set_status(f"{n} operasyon satırı kaydedildi.")
+        self.app._load_data()
 
     def _ops_import_excel(self):
-        path = filedialog.askopenfilename(title="REFERANS PRES dosyasını seçin",
+        path = _Parented(filedialog, self).askopenfilename(title="REFERANS PRES dosyasını seçin",
                                           filetypes=[("Excel dosyaları", "*.xlsx *.xlsm *.xls")])
         if not path:
             return
         try:
             names = sheet_names(path)
         except Exception as e:
-            messagebox.showerror("Hata", f"Dosya açılamadı:\n{e}")
+            _Parented(messagebox, self).showerror("Hata", f"Dosya açılamadı:\n{e}")
             return
         sheet = OP_SHEET_DEFAULT if OP_SHEET_DEFAULT in names else None
         if sheet is None:
@@ -1133,30 +1299,362 @@ class App(ctk.CTk):
                 except Exception:
                     continue
         if sheet is None:
-            messagebox.showerror("Bulunamadı", "Dosyada 'BİTMİŞ ÜRÜN KODU' başlıklı bir operasyon sayfası bulunamadı.")
+            _Parented(messagebox, self).showerror("Bulunamadı", "Dosyada 'BİTMİŞ ÜRÜN KODU' başlıklı bir operasyon sayfası bulunamadı.")
             return
         try:
             df, warns = parse_operations(path, sheet)
         except Exception as e:
-            messagebox.showerror("Okunamadı", str(e))
+            _Parented(messagebox, self).showerror("Okunamadı", str(e))
             return
         msg = f"{os.path.basename(path)} / {sheet}\n{len(df)} operasyon satırı, {df['urun_kodu'].nunique()} ürün okundu."
         if warns:
             msg += "\n\n• " + "\n• ".join(warns)
         if not self.ops_draft.empty:
-            ans = messagebox.askyesnocancel(
+            ans = _Parented(messagebox, self).askyesnocancel(
                 "Excel'den Al", msg + f"\n\nListede şu an {len(self.ops_draft)} satır var.\n"
                 "EVET = mevcut listenin yerine geçsin\nHAYIR = mevcut listenin sonuna eklensin\nİPTAL = vazgeç")
             if ans is None:
                 return
-            self.ops_draft = df if ans else pd.concat([self.ops_draft, df], ignore_index=True)
+            if ans:
+                self.ops_draft = df
+            else:
+                existing = set(op_keys(self.ops_draft))
+                new = df[~op_keys(df).isin(existing)]
+                skipped = len(df) - len(new)
+                self.ops_draft = pd.concat([self.ops_draft, new], ignore_index=True)
+                if skipped:
+                    _Parented(messagebox, self).showinfo(
+                        "Zaten listede olanlar atlandı",
+                        f"{skipped} satır listede zaten olduğu için (aynı ürün + operasyon) eklenmedi.\n"
+                        f"Eklenen yeni satır: {len(new)}")
         else:
-            if not messagebox.askyesno("Excel'den Al", msg + "\n\nListeye alınsın mı?"):
+            if not _Parented(messagebox, self).askyesno("Excel'den Al", msg + "\n\nListeye alınsın mı?"):
                 return
             self.ops_draft = df
         self.ops_draft = self.ops_draft.reset_index(drop=True)
         self._ops_set_dirty(True)
-        messagebox.showinfo("Taslağa alındı", "Satırlar listeye alındı. Kontrol edip 'Kaydet'e basınca veritabanına yazılır.")
+        _Parented(messagebox, self).showinfo("Taslağa alındı", "Satırlar listeye alındı. Kontrol edip 'Kaydet'e basınca veritabanına yazılır.")
+
+
+def parse_qty(text: str) -> float:
+    """Türkçe sayı girişi: '15.000' -> 15000, '1.234,5' -> 1234.5, '12,5' -> 12.5, '1500' -> 1500."""
+    t = str(text).strip().replace(" ", "")
+    if re.fullmatch(r"\d{1,3}(\.\d{3})+(,\d+)?", t):     # binlik nokta
+        t = t.replace(".", "")
+    return float(t.replace(",", "."))
+
+
+def order_key(urun, firma, yil, hafta) -> str:
+    return f"{urun}|{firma}|{int(yil)}|{int(hafta)}"
+
+
+class OrdersWindow(ctk.CTkToplevel):
+    """Hesaptaki siparişleri görme, yeni sipariş ekleme, adet değiştirme ve silme.
+    Değişiklikler 'Kaydet'e kadar taslakta kalır; kayıt Aktarımlar'da 'Elle düzenleme' olarak görünür."""
+
+    def __init__(self, app, db_path):
+        super().__init__(app)
+        self.app, self.db_path = app, db_path
+        self.title(f"Siparişler – {os.path.basename(db_path)}")
+        self.geometry("1150x680")
+        self.transient(app)
+        self.grab_set()
+        self.protocol("WM_DELETE_WINDOW", self._close)
+        bring_to_front(self)
+        self.changes = {}     # anahtar -> {urun_kodu, firma, yil, ay, hafta, adet}  (adet 0 = sil)
+        try:
+            self.products = set(load_operations(db_path)["urun_kodu"].map(normalize_code))
+        except Exception:
+            self.products = set()
+
+        t = ctk.CTkFrame(self, fg_color="transparent")
+        t.pack(fill="both", expand=True, padx=10, pady=10)
+        bar = ctk.CTkFrame(t, fg_color="transparent")
+        bar.pack(fill="x", pady=(0, 4))
+        ctk.CTkButton(bar, text="Yeni Sipariş", width=110, fg_color=COLOR_OK, hover_color="#24804a",
+                      command=self._add).pack(side="left", padx=3)
+        ctk.CTkButton(bar, text="Adet Değiştir", width=110, command=self._edit).pack(side="left", padx=3)
+        ctk.CTkButton(bar, text="Sil", width=60, fg_color=COLOR_OVER, hover_color="#b03636",
+                      command=self._delete).pack(side="left", padx=3)
+        ctk.CTkLabel(bar, text="  Ay:").pack(side="left")
+        self.month_filter = ctk.CTkComboBox(bar, values=["Tümü"], width=150, command=lambda _: self._show())
+        self.month_filter.set("Tümü")
+        self.month_filter.pack(side="left", padx=3)
+        ctk.CTkLabel(bar, text="  Ara:").pack(side="left")
+        self.search = ctk.CTkEntry(bar, width=160, placeholder_text="ürün kodu, firma…")
+        self.search.pack(side="left", padx=3)
+        self.search.bind("<KeyRelease>", lambda _: self._show())
+        self.cancel_btn = ctk.CTkButton(bar, text="Vazgeç", width=80, fg_color="gray55", state="disabled",
+                                        command=self._cancel)
+        self.cancel_btn.pack(side="right", padx=3)
+        self.save_btn = ctk.CTkButton(bar, text="Kaydet", width=90, state="disabled",
+                                      font=ctk.CTkFont(weight="bold"), command=self._save)
+        self.save_btn.pack(side="right", padx=3)
+        self.label = ctk.CTkLabel(t, text="", anchor="w")
+        self.label.pack(fill="x", padx=4)
+        self.table = DataTable(t)
+        self.table.pack(fill="both", expand=True)
+        self.table.tree.bind("<Double-1>", lambda _: self._edit())
+        self.table.tree.bind("<Delete>", lambda _: self._delete())
+        self._reload()
+
+    # --- veri ---
+    def _reload(self):
+        try:
+            self.base = load_valid_orders(self.db_path)
+        except Exception as e:
+            _Parented(messagebox, self).showerror("Hata", f"Siparişler okunamadı:\n{e}")
+            self.base = pd.DataFrame(columns=["urun_kodu", "firma", "yil", "ay", "hafta", "adet", "kaynak"])
+        self.changes = {}
+        self._set_dirty()
+
+    def _set_dirty(self):
+        st = "normal" if self.changes else "disabled"
+        self.save_btn.configure(state=st)
+        self.cancel_btn.configure(state=st)
+        self._show()
+
+    def _merged(self) -> pd.DataFrame:
+        df = self.base.copy()
+        df["_key"] = [order_key(*k) for k in zip(df["urun_kodu"], df["firma"], df["yil"], df["hafta"])]
+        df["durum"] = ""
+        df = df.set_index("_key", drop=False)
+        for k, c in self.changes.items():
+            if k in df.index:
+                old = df.at[k, "adet"]
+                df.at[k, "adet"] = c["adet"]
+                df.at[k, "durum"] = "SİLİNECEK" if c["adet"] == 0 else f"DEĞİŞTİ (önce {fmt_num(old, 0)})"
+            elif c["adet"] > 0:
+                df.loc[k] = {**c, "_key": k, "kaynak": "yeni", "tarih": "", "aktarim_id": None,
+                             "hafta_yili": None, "durum": "YENİ"}
+        df["ay_no"] = df["ay"].map(lambda a: AY_ADLARI.index(a) + 1 if a in AY_ADLARI else 99)
+        return df.sort_values(["yil", "ay_no", "hafta", "urun_kodu", "firma"]).reset_index(drop=True)
+
+    def _show(self):
+        df = self._merged()
+        months = list(dict.fromkeys(f"{a} {y}" for a, y in zip(df["ay"], df["yil"])))
+        self.month_filter.configure(values=["Tümü"] + months)
+        sel = self.month_filter.get()
+        if sel != "Tümü" and sel in months:
+            df = df[(df["ay"] + " " + df["yil"].astype(str)) == sel]
+        q = fold(self.search.get()) if self.search.get().strip() else ""
+        if q:
+            df = df[(df["urun_kodu"].map(fold) + " " + df["firma"].map(fold)).str.contains(re.escape(q), regex=True)]
+        view = pd.DataFrame({
+            "#": df["_key"], "Ay": df["ay"] + " " + df["yil"].astype(str), "Hafta": "W" + df["hafta"].astype(int).astype(str),
+            "Firma": df["firma"], "Ürün kodu": df["urun_kodu"], "Adet": df["adet"].astype(float),
+            "Kaynak": df["kaynak"], "Durum": df["durum"],
+        })
+        tag = lambda r: "over" if r["Durum"] == "SİLİNECEK" else ("warn" if r["Durum"] else "")
+        self.table.show(view.reset_index(drop=True), tag_func=tag)
+        bk = set(self.base_keys())
+        n_new = sum(1 for k, c in self.changes.items() if c["adet"] > 0 and k not in bk)
+        n_del = sum(1 for c in self.changes.values() if c["adet"] == 0)
+        info = f"{len(view)} sipariş satırı gösteriliyor"
+        if self.changes:
+            info += (f"   ●  KAYDEDİLMEMİŞ: {n_new} yeni, {len(self.changes) - n_new - n_del} adet değişikliği, "
+                     f"{n_del} silme – 'Kaydet' demeden hesaba yansımaz")
+        self.label.configure(text=info, text_color=COLOR_OVER if self.changes else "#333")
+
+    def base_keys(self):
+        return [order_key(*k) for k in zip(self.base["urun_kodu"], self.base["firma"], self.base["yil"], self.base["hafta"])]
+
+    def _selected(self):
+        return [self.table.tree.item(i, "values")[0] for i in self.table.tree.selection()]
+
+    def _row(self, key) -> dict:
+        df = self._merged().set_index("_key")
+        r = df.loc[key]
+        return {"urun_kodu": r["urun_kodu"], "firma": r["firma"], "yil": int(r["yil"]), "ay": r["ay"],
+                "hafta": int(r["hafta"]), "adet": float(r["adet"])}
+
+    # --- işlemler ---
+    def _add(self):
+        sel = self.month_filter.get()
+        default = None
+        if sel != "Tümü":
+            ay, yil = sel.rsplit(" ", 1)
+            default = {"ay": ay, "yil": int(yil)}
+        OrderDialog(self, None, self._store, default=default)
+
+    def _edit(self):
+        sel = self._selected()
+        if len(sel) != 1:
+            _Parented(messagebox, self).showinfo("Seçim", "Adedini değiştirmek için tek bir satır seçin (veya çift tıklayın).")
+            return
+        OrderDialog(self, self._row(sel[0]), lambda rec: self._store(rec, edit=True))
+
+    def _store(self, rec, edit=False):
+        """Taslağa yazar. Hata/vazgeçme varsa metin döner (pencere açık kalır)."""
+        k = order_key(rec["urun_kodu"], rec["firma"], rec["yil"], rec["hafta"])
+        if not edit:
+            current = self._merged().set_index("_key")
+            if k in current.index and current.at[k, "adet"] > 0:
+                old = float(current.at[k, "adet"])
+                ans = _Parented(messagebox, self).askyesnocancel(
+                    "Bu sipariş zaten var",
+                    f"{rec['urun_kodu']} / {rec['firma'] or '(firma yok)'} / {rec['ay']} {rec['yil']} W{rec['hafta']} "
+                    f"için zaten {fmt_num(old, 0)} adet var.\n\n"
+                    f"EVET = {fmt_num(rec['adet'], 0)} adet olsun (eskinin yerine)\n"
+                    f"HAYIR = üstüne eklensin ({fmt_num(old + rec['adet'], 0)} adet)\nİPTAL = vazgeç")
+                if ans is None:
+                    return "vazgeçildi"
+                if not ans:
+                    rec = {**rec, "adet": old + rec["adet"]}
+        base_keys = set(self.base_keys())
+        if k not in base_keys and rec["adet"] == 0:
+            self.changes.pop(k, None)      # kaydedilmemiş yeni satırın silinmesi
+        else:
+            self.changes[k] = dict(rec)
+        self._set_dirty()
+        return None
+
+    def _delete(self):
+        sel = self._selected()
+        if not sel:
+            _Parented(messagebox, self).showinfo("Seçim", "Silmek için satır seçin (Ctrl / Shift ile birden fazla).")
+            return
+        if not _Parented(messagebox, self).askyesno(
+                "Sil", f"{len(sel)} sipariş satırı silinsin (iptal) mi?\n"
+                       "Kaydet'e kadar 'Vazgeç' ile geri alınabilir; kaydettikten sonra da Aktarımlar'dan geri alınabilir."):
+            return
+        for k in sel:
+            self._store({**self._row(k), "adet": 0.0}, edit=True)
+
+    def _cancel(self):
+        if _Parented(messagebox, self).askyesno("Vazgeç", "Kaydedilmemiş tüm değişiklikler iptal edilsin mi?"):
+            self.changes = {}
+            self._set_dirty()
+
+    def _save(self):
+        if not self.changes:
+            return
+        n_del = sum(1 for c in self.changes.values() if c["adet"] == 0)
+        months = sorted({f"{c['ay']} {c['yil']}" for c in self.changes.values()})
+        dlg = ctk.CTkInputDialog(title="Kaydet",
+                                 text=f"{len(self.changes)} değişiklik ({n_del} silme) kaydedilecek: {', '.join(months)}\n\n"
+                                      "Kısa bir açıklama yazın (ör. 'Valeo W41 iptal'), boş bırakabilirsiniz:")
+        aciklama = dlg.get_input()
+        if aciklama is None:
+            return
+        aciklama = aciklama.strip() if isinstance(aciklama, str) else ""
+        try:
+            save_manual_orders(self.db_path, list(self.changes.values()), aciklama)
+        except Exception as e:
+            _Parented(messagebox, self).showerror("Kaydedilemedi", f"Hiçbir şey değişmedi.\n\n{type(e).__name__}: {e}")
+            return
+        self._reload()
+        self.app._show_db_info()
+        self.app._refresh_imports()
+        self.app._set_status("Sipariş değişiklikleri kaydedildi (Aktarımlar: 'Elle düzenleme').")
+        self.app._load_data()
+
+    def _close(self):
+        if self.changes and not _Parented(messagebox, self).askyesno(
+                "Kaydedilmemiş değişiklik", "Kaydedilmemiş değişiklikler var.\n\nKaydetmeden kapatılsın mı? (Değişiklikler iptal olur)"):
+            return
+        self.grab_release()
+        self.destroy()
+
+
+class OrderDialog(ctk.CTkToplevel):
+    """Yeni sipariş ekleme veya adet değiştirme."""
+
+    def __init__(self, master, rec, on_ok, default=None):
+        super().__init__(master)
+        self.edit = rec is not None
+        self.title("Adet değiştir" if self.edit else "Yeni sipariş")
+        self.geometry("420x360")
+        self.transient(master)
+        self.grab_set()
+        self.protocol("WM_DELETE_WINDOW", self.destroy)
+        bring_to_front(self)
+        self.on_ok, self.owner = on_ok, master
+        now = datetime.now()
+        rec = rec or {"urun_kodu": "", "firma": "", "yil": (default or {}).get("yil", now.year),
+                      "ay": (default or {}).get("ay", AY_ADLARI[now.month - 1]), "hafta": "", "adet": ""}
+        f = ctk.CTkFrame(self)
+        f.pack(fill="both", expand=True, padx=12, pady=12)
+        self.w = {}
+        fields = [("urun_kodu", "Ürün kodu *"), ("firma", "Firma"), ("yil", "Yıl *"), ("ay", "Ay *"),
+                  ("hafta", "Hafta (W) *"), ("adet", "Adet *")]
+        for i, (k, label) in enumerate(fields):
+            ctk.CTkLabel(f, text=label, anchor="w").grid(row=i, column=0, sticky="w", padx=8, pady=5)
+            w = ctk.CTkComboBox(f, values=AY_ADLARI, width=200) if k == "ay" else ctk.CTkEntry(f, width=200)
+            w.grid(row=i, column=1, padx=8, pady=5)
+            val = rec.get(k, "")
+            if k == "adet" and val != "":
+                val = fmt_input(val)
+            if isinstance(w, ctk.CTkComboBox):
+                w.set(str(val))
+            elif str(val) != "":
+                w.insert(0, str(val))
+            if self.edit and k != "adet":
+                w.configure(state="disabled")
+            self.w[k] = w
+        ctk.CTkLabel(f, text=("Sadece adet değiştirilebilir. Siparişi kaldırmak için 'Sil'i kullanın."
+                              if self.edit else "Hafta numarası ISO takvimine göre (W41 = 5–11 Ekim 2026)."),
+                     text_color="#666", wraplength=380, justify="left").grid(row=len(fields), column=0, columnspan=2,
+                                                                          sticky="w", padx=8, pady=6)
+        b = ctk.CTkFrame(self, fg_color="transparent")
+        b.pack(fill="x", padx=12, pady=(0, 12))
+        ctk.CTkButton(b, text="Tamam", command=self._ok).pack(side="right", padx=4)
+        ctk.CTkButton(b, text="İptal", fg_color="gray55", command=self.destroy).pack(side="right", padx=4)
+
+    def destroy(self):
+        owner = self.owner
+        super().destroy()
+        try:
+            owner.grab_set()
+            owner.lift()
+        except Exception:
+            pass
+
+    def _ok(self):
+        mb = _Parented(messagebox, self)
+        g = lambda k: self.w[k].get().strip()
+        rec = {"urun_kodu": normalize_code(g("urun_kodu")), "firma": g("firma"), "ay": g("ay").upper()}
+        errors = []
+        try:
+            rec["yil"] = int(g("yil"))
+            assert 2000 <= rec["yil"] <= 2100
+        except Exception:
+            errors.append("Yıl 2000–2100 arası bir sayı olmalı.")
+        try:
+            rec["hafta"] = int(g("hafta").upper().lstrip("W"))
+            assert 1 <= rec["hafta"] <= 53
+        except Exception:
+            errors.append("Hafta 1–53 arası bir sayı olmalı (ör. 41 veya W41).")
+        try:
+            rec["adet"] = parse_qty(g("adet"))
+            assert rec["adet"] >= 0 and (self.edit or rec["adet"] > 0)
+        except Exception:
+            errors.append("Adet 0'dan büyük bir sayı olmalı.")
+        if not rec["urun_kodu"]:
+            errors.append("Ürün kodu boş olamaz.")
+        elif not re.search(r"\d", rec["urun_kodu"]):
+            errors.append("Ürün kodunda en az bir rakam olmalı.")
+        if rec["ay"] not in AY_ADLARI:
+            errors.append("Ay listeden seçilmeli.")
+        if errors:
+            mb.showwarning("Eksik / hatalı bilgi", "\n".join(errors))
+            return
+        if not self.edit:
+            ay_no = AY_ADLARI.index(rec["ay"]) + 1
+            problem = week_month_problem(rec["hafta"], hafta_yili(rec["yil"], ay_no, rec["hafta"]), ay_no, rec["yil"])
+            if problem and not mb.askyesno("Hafta – ay uyumu", problem + "\n\nYine de eklensin mi?"):
+                return
+            if self.owner.products and rec["urun_kodu"] not in self.owner.products:
+                if not mb.askyesno("Operasyon yok",
+                                   f"{rec['urun_kodu']} için Operasyonlar listesinde kayıt yok; bu siparişin saati "
+                                   "hesaplanamaz ('Eşleşmeyenler'de görünür).\n\nYine de eklensin mi?"):
+                    return
+        err = self.on_ok(rec)
+        if err and err != "vazgeçildi":
+            mb.showwarning("Eklenemedi", err)
+            return
+        if err != "vazgeçildi":
+            self.destroy()
 
 
 class OpDialog(ctk.CTkToplevel):
@@ -1168,6 +1666,15 @@ class OpDialog(ctk.CTkToplevel):
               ("alternatif_4", "alternatif 4", False), ("uretim_saniye", "ÜRETİM SANİYE", True)]
     MACHINE_FIELDS = {"uretim_presi", "alternatif_1", "alternatif_2", "alternatif_3", "alternatif_4"}
 
+    def destroy(self):
+        owner = self.master
+        super().destroy()
+        try:   # Operasyonlar penceresi tekrar önde ve kilitli kalsın
+            owner.grab_set()
+            owner.lift()
+        except Exception:
+            pass
+
     def __init__(self, master, rec, machines, on_ok):
         super().__init__(master)
         self.title("Operasyon düzenle" if rec else "Yeni operasyon")
@@ -1176,6 +1683,8 @@ class OpDialog(ctk.CTkToplevel):
         self.grab_set()
         self.on_ok = on_ok
         self.machines = list(machines)
+        self.protocol("WM_DELETE_WINDOW", self.destroy)
+        bring_to_front(self)
         self.widgets = {}
         f = ctk.CTkFrame(self)
         f.pack(fill="both", expand=True, padx=12, pady=12)
@@ -1234,7 +1743,10 @@ class OpDialog(ctk.CTkToplevel):
                                            f"'{m}' listede yok.{hint}\n\nYeni bir pres olarak kaydedilsin mi?\n"
                                            "(Hayır derseniz düzeltebilirsiniz)", parent=self):
                     return
-        self.on_ok(rec)
+        err = self.on_ok(rec)
+        if err:
+            messagebox.showwarning("Tekrar eden operasyon", err, parent=self)
+            return
         self.destroy()
 
 
@@ -1244,6 +1756,7 @@ class ImportDialog(ctk.CTkToplevel):
     def __init__(self, master, db_path, on_done):
         super().__init__(master)
         self.title("Excel'den Veritabanına Aktar")
+        bring_to_front(self)
         self.geometry("780x600")
         self.transient(master)
         self.grab_set()
@@ -1266,7 +1779,15 @@ class ImportDialog(ctk.CTkToplevel):
                      anchor="w").pack(fill="x", padx=16)
         self.blocks_frame = ctk.CTkScrollableFrame(self, height=150)
         self.blocks_frame.pack(fill="x", padx=12, pady=4)
-        self.info = ctk.CTkTextbox(self, height=180)
+        m = ctk.CTkFrame(self)
+        m.pack(fill="x", padx=12, pady=4)
+        ctk.CTkLabel(m, text="Bu ay veritabanında zaten varsa:").pack(side="left", padx=8, pady=6)
+        self.mode = ctk.StringVar(value="yerine")
+        ctk.CTkRadioButton(m, text="Yerine geçsin (aynı dosyanın güncel hali)", variable=self.mode,
+                           value="yerine").pack(side="left", padx=8)
+        ctk.CTkRadioButton(m, text="Üstüne eklensin (başka müşterinin dosyası)", variable=self.mode,
+                           value="ekle").pack(side="left", padx=8)
+        self.info = ctk.CTkTextbox(self, height=160)
         self.info.pack(fill="both", expand=True, padx=12, pady=4)
         b = ctk.CTkFrame(self, fg_color="transparent")
         b.pack(fill="x", padx=12, pady=(4, 12))
@@ -1312,7 +1833,7 @@ class ImportDialog(ctk.CTkToplevel):
             self._set_info(f"OKUNAMADI\n\n{e}")
             return
         for i, blk in enumerate(plan.blocks):
-            n = int((plan.orders["blok"] == i).sum())
+            n = int(((plan.orders["blok"] == i) & (plan.orders["adet"] > 0)).sum())
             weeks = ", ".join(f"W{h}" for h in sorted(set(blk.weeks.values())))
             row = ctk.CTkFrame(self.blocks_frame, fg_color="transparent")
             row.pack(fill="x", pady=2)
@@ -1329,7 +1850,7 @@ class ImportDialog(ctk.CTkToplevel):
             self.year_entries.append(e)
         lines = [f"Dosya: {os.path.basename(path)}  /  Sayfa: {sheet}",
                  f"Ürün (ürün + firma): {plan.n_products}",
-                 f"Sipariş satırı (adet > 0): {len(plan.orders)}",
+                 f"Sipariş satırı (adet > 0): {int((plan.orders['adet'] > 0).sum())}",
                  f"Backlog/stok satırı: {len(plan.backlog)}  → {plan.blocks[0].ay} ayına yazılacak"]
         if plan.warnings:
             lines += ["", "UYARILAR:"] + [f"• {w}" for w in plan.warnings[:30]]
@@ -1355,20 +1876,21 @@ class ImportDialog(ctk.CTkToplevel):
             messagebox.showwarning("Yıl eksik", str(e), parent=self)
             return
         try:
-            notes = check_conflicts(self.db_path, self.plan, years)
+            mod = self.mode.get() or "yerine"
+            notes = check_conflicts(self.db_path, self.plan, years, mod)
         except Exception as e:
             messagebox.showerror("Hata", f"Veritabanı kontrol edilemedi:\n{e}", parent=self)
             return
         summary = ", ".join(f"{b.ay} {years[i]}" for i, b in enumerate(self.plan.blocks))
         msg = f"Şu aylar veritabanına yazılacak:\n{summary}"
-        if self.plan.orders.empty:
+        if not (self.plan.orders["adet"] > 0).any():
             msg += "\n\nUYARI: Dosyada hiç sipariş adedi bulunamadı (tüm haftalar boş veya 0)."
         if notes:
             msg += "\n\nDİKKAT:\n• " + "\n• ".join(notes)
         if not messagebox.askyesno("Onay", msg + "\n\nDevam edilsin mi?", parent=self):
             return
         try:
-            ids = import_plan(self.db_path, self.plan, years)
+            ids = import_plan(self.db_path, self.plan, years, mod)
         except Exception as e:
             messagebox.showerror("Yazılamadı", f"Hiçbir şey yazılmadı.\n\n{type(e).__name__}: {e}", parent=self)
             return
