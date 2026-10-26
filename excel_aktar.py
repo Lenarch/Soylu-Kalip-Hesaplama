@@ -24,7 +24,7 @@ import pandas as pd
 from openpyxl.utils import get_column_letter
 
 from capacity_engine import normalize_code
-from veritabani import connect, create_empty_db, hafta_yili
+from veritabani import connect, create_empty_db, hafta_yili, normalize_firma, current_user
 
 AYLAR = ["OCAK", "ŞUBAT", "MART", "NİSAN", "MAYIS", "HAZİRAN",
          "TEMMUZ", "AĞUSTOS", "EYLÜL", "EKİM", "KASIM", "ARALIK"]
@@ -76,6 +76,12 @@ class ParsedPlan:
     warnings: List[str]
 
 
+try:   # zararlı XML'e karşı koruma: kuruluysa openpyxl bunu kendiliğinden kullanır
+    import defusedxml  # noqa: F401
+    from openpyxl.xml import DEFUSEDXML as XML_PROTECTED
+except Exception:
+    XML_PROTECTED = False
+
 try:   # eski .xls dosyaları için (exe'ye dahil edilsin diye burada açıkça içe aktarılır)
     import xlrd  # noqa: F401
     HAS_XLRD = True
@@ -93,15 +99,41 @@ def _check_format(path: str):
         raise ValueError(f"Desteklenmeyen dosya türü: {ext or '(uzantı yok)'}. .xlsx, .xlsm veya .xls seçin.")
 
 
+def _security_error(exc) -> bool:
+    """Hata zincirinde defusedxml'in güvenlik reddi (DTD / entity) var mı?"""
+    seen = 0
+    while exc is not None and seen < 10:
+        if "Forbidden" in type(exc).__name__ or "DTD" in type(exc).__name__:
+            return True
+        exc = exc.__cause__ or exc.__context__
+        seen += 1
+    return False
+
+
+SECURITY_MSG = ("Bu Excel dosyası güvenlik kontrolünden geçmedi: içinde zararlı olabilecek bir XML yapısı var "
+                "(normal Excel dosyalarında olmaz). Dosya okunmadı. Gönderen kişiden dosyayı Excel'de açıp "
+                "yeniden kaydetmesini veya temiz bir kopya göndermesini isteyin.")
+
+
 def read_sheet(path: str, sheet: str) -> pd.DataFrame:
     """Sayfayı başlıksız okur (.xlsx/.xlsm: openpyxl, .xls: xlrd)."""
     _check_format(path)
-    return pd.read_excel(path, sheet_name=sheet, header=None)
+    try:
+        return pd.read_excel(path, sheet_name=sheet, header=None)
+    except Exception as e:
+        if _security_error(e):
+            raise ValueError(SECURITY_MSG) from e
+        raise
 
 
 def sheet_names(path: str) -> List[str]:
     _check_format(path)
-    return pd.ExcelFile(path).sheet_names
+    try:
+        return pd.ExcelFile(path).sheet_names
+    except Exception as e:
+        if _security_error(e):
+            raise ValueError(SECURITY_MSG) from e
+        raise
 
 
 def parse_plan(path: str, sheet: str) -> ParsedPlan:
@@ -159,6 +191,7 @@ def parse_plan(path: str, sheet: str) -> ParsedPlan:
     num = lambda v: pd.to_numeric(v, errors="coerce")
     orders, backlog, refs = [], [], set()
     not_codes = []   # ürün kodu sütununda kod olmayan değerler (ör. firma adı)
+    fractional = []  # kesirli adetler (ör. 1,5) – yazım hatası olabilir
     for _, row in data.iterrows():
         ref = normalize_code(row.iloc[c_ref])
         if not ref or "TOPLAM" in fold(ref):
@@ -168,7 +201,7 @@ def parse_plan(path: str, sheet: str) -> ParsedPlan:
             # sayfanın altında farklı düzende duran başka bir bloktur -> okunmaz.
             not_codes.append(ref)
             continue
-        firma = str(row.iloc[c_firma]).strip() if c_firma is not None and pd.notna(row.iloc[c_firma]) else ""
+        firma = normalize_firma(row.iloc[c_firma]) if c_firma is not None and pd.notna(row.iloc[c_firma]) else ""
         refs.add((ref, firma))
         for bi, b in enumerate(block_list):
             for col, hafta in b.weeks.items():
@@ -177,6 +210,8 @@ def parse_plan(path: str, sheet: str) -> ParsedPlan:
                     if q < 0:
                         warnings.append(f"{ref} W{hafta}: negatif adet ({q:g}) atlandı.")
                         continue
+                    if q != int(q):
+                        fractional.append(f"{ref} W{hafta}: {q:g}".replace(".", ","))
                     orders.append((ref, firma, bi, hafta, float(q)))
         stok = num(row.iloc[c_stok]) if c_stok is not None else None
         stok = 0.0 if stok is None or pd.isna(stok) else float(stok)
@@ -203,6 +238,9 @@ def parse_plan(path: str, sheet: str) -> ParsedPlan:
     if not any(o[4] > 0 for o in orders):
         warnings.append("Dosyada hiç sipariş adedi bulunamadı (tüm hafta hücreleri boş veya 0).")
 
+    if fractional:
+        warnings.append(f"{len(fractional)} hücrede kesirli adet var (ör. {', '.join(fractional[:4])}). "
+                        "Sipariş adedi genelde tam sayıdır; Excel'de binlik/ondalık yazımını kontrol edin.")
     if not_codes:
         uniq = list(dict.fromkeys(not_codes))
         warnings.insert(0, f"{len(not_codes)} satır atlandı: REFERANS sütunundaki değer ürün kodu gibi görünmüyor "
@@ -317,10 +355,10 @@ def import_plan(db_path: str, plan: ParsedPlan, years: Dict[int, int], mod: str 
                 bl = plan.backlog if bi == 0 else plan.backlog.iloc[0:0]
                 cur = con.execute(
                     "INSERT INTO aktarimlar(tarih, dosya_adi, sayfa, yil, ay, ay_no, haftalar, siparis_satir, "
-                    "backlog_satir, mod) VALUES (?,?,?,?,?,?,?,?,?,?)",
+                    "backlog_satir, mod, kullanici) VALUES (?,?,?,?,?,?,?,?,?,?,?)",
                     (now, os.path.basename(plan.path), plan.sheet, yil, b.ay, b.ay_no,
                      ",".join(str(h) for h in sorted(set(b.weeks.values()))), int((o["adet"] > 0).sum()), len(bl),
-                     "ekle" if mod == "ekle" else "yerine"))
+                     "ekle" if mod == "ekle" else "yerine", current_user()))
                 aid = cur.lastrowid
                 con.executemany(
                     "INSERT INTO siparisler(aktarim_id, urun_kodu, firma, yil, hafta, hafta_yili, ay, adet) "

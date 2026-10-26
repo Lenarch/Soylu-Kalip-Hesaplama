@@ -108,7 +108,7 @@ class CapacityEngine:
     def load_from_db(self, db_path: str):
         """SQLite veritabanından okur; Excel'deki ile aynı tablo yapısını kurar.
         Sadece geçerli yüklemeler okunur (her yıl + ay için en son, geri alınmamış yükleme)."""
-        from veritabani import connect, create_empty_db, hafta_yili
+        from veritabani import connect, create_empty_db, hafta_yili, normalize_firma
         if not os.path.exists(db_path):
             raise FileNotFoundError(f"Veritabanı bulunamadı: {db_path}")
         create_empty_db(db_path)   # eksik tablo/görünüm varsa ekler, veriye dokunmaz
@@ -130,6 +130,7 @@ class CapacityEngine:
 
         # --- Siparişler: uzun tablo -> haftalık geniş tablo ---
         orders["urun_kodu"] = orders["urun_kodu"].apply(normalize_code)
+        orders["firma"] = orders["firma"].apply(normalize_firma)
         orders = orders[orders["urun_kodu"] != ""].copy()
         for c in ("yil", "hafta"):
             orders[c] = pd.to_numeric(orders[c], errors="coerce")
@@ -180,6 +181,7 @@ class CapacityEngine:
 
         # --- Backlog: ay ay ayrı sütunlar ("Backlog@EYLÜL 2026") ---
         backlog["urun_kodu"] = backlog["urun_kodu"].apply(normalize_code)
+        backlog["firma"] = backlog["firma"].apply(normalize_firma)
         backlog = backlog[backlog["urun_kodu"] != ""].copy()
         for c in ("backlog_adet", "stok_adet"):
             backlog[c] = pd.to_numeric(backlog[c], errors="coerce").fillna(0)
@@ -277,6 +279,14 @@ class CapacityEngine:
         """
         Madde 1: İstenirse belirli aylar, seçilmezse tüm aylar için hesaplama yapar.
         """
+        df, group_cols = self._row_hours(selected_months)
+        # Makine Bazında Özet
+        summary = df.groupby("Üretim presi")[group_cols].sum().reset_index()
+        summary = summary.sort_values(by="TOPLAM_SAAT", ascending=False).reset_index(drop=True)
+        return summary
+
+    def _row_hours(self, selected_months: Optional[List[str]] = None):
+        """Her iş (ürün × operasyon) satırı için saatleri hesaplar. (satır tablosu, özet sütunları) döner."""
         df = self.merged_df.copy()
 
         # Hangi haftalar hesaba katılacak?
@@ -342,13 +352,84 @@ class CapacityEngine:
         # Genel Toplam
         all_week_saat = [f"{w}_Saat" for w in active_weeks]
         df["TOPLAM_SAAT"] = df[all_week_saat].sum(axis=1)
+        df["TOPLAM_ADET"] = df[list(active_weeks)].sum(axis=1) if active_weeks else 0.0
 
-        # Makine Bazında Özet
         group_cols = (ay_saat_cols + all_week_saat + [f"{b}_Saat" for b in self.backlog_columns]
                       + ["STOKTAN_KARSILANAN_SAAT", "TOPLAM_SAAT"])
-        summary = df.groupby("Üretim presi")[group_cols].sum().reset_index()
-        summary = summary.sort_values(by="TOPLAM_SAAT", ascending=False).reset_index(drop=True)
-        return summary
+        return df, group_cols
+
+    # ------------------------------------------------------------------
+    # Serbest (iş bazında) simülasyon
+    # ------------------------------------------------------------------
+    ALT_COLS = ["alternatif 1", "alternatif 2", "alternatif 3", "alternatif 4"]
+
+    def job_list(self, machine: str, selected_months: Optional[List[str]] = None) -> pd.DataFrame:
+        """Bir makinenin işleri (seçili aylardaki adet / saat, stok düşülmüş) ve tanımlı alternatifleri.
+        'SATIR' sütunu simulate_plan'e verilecek iş numarasıdır."""
+        machine = normalize_machine(machine)
+        df, _ = self._row_hours(selected_months)
+        df["SATIR"] = df.index
+        jobs = df[df["Üretim presi"] == machine]
+        cols = ["SATIR", "Üretim presi", self.ref_col, "OPERASYON STOK KODU", "FİRMA", "ÜRETİM SANİYE", "TOPLAM_ADET", "TOPLAM_SAAT"]
+        cols = [c for c in cols if c in jobs.columns] + [c for c in self.ALT_COLS if c in jobs.columns]
+        out = jobs[cols].copy()
+        for c in self.ALT_COLS:
+            if c in out.columns:
+                out[c] = out[c].fillna("").astype(str)
+        return out.sort_values("TOPLAM_SAAT", ascending=False).reset_index(drop=True)
+
+    @classmethod
+    def job_targets(cls, job_row) -> List[str]:
+        """İşin tanımlı alternatif presleri (sırayla, tekrarsız, ana pres hariç)."""
+        main = job_row.get("Üretim presi", None)
+        out = []
+        for c in cls.ALT_COLS:
+            v = job_row.get(c, "")
+            if isinstance(v, str) and v and v not in out and v != main:
+                out.append(v)
+        return out
+
+    def simulate_plan(self, transfers: List[dict], selected_months: Optional[List[str]] = None) -> pd.DataFrame:
+        """Birden çok aktarımı birlikte uygular.
+        transfers: [{"row": SATIR, "target": "MK178", "ratio": 0.5}, ...]  (ratio 0–1, işin payı)
+        Aktarılan pay hedef makinede aynı saniyeyle hesaplanır. Aynı işin payları toplamı 1'i geçemez."""
+        df = self.merged_df.copy()
+        qty_cols = self.week_columns + self.backlog_columns + list(getattr(self, "extra_qty_columns", []))
+        qty_cols = [q for q in dict.fromkeys(qty_cols) if q in df.columns]
+        df[qty_cols] = df[qty_cols].astype(float)
+
+        by_row: Dict[int, List[dict]] = {}
+        for t in transfers:
+            by_row.setdefault(int(t["row"]), []).append(t)
+
+        extra = []
+        for row, ts in by_row.items():
+            if row not in df.index:
+                raise ValueError(f"İş bulunamadı (satır {row}). Veriler yeniden yüklendiyse senaryoyu yeniden kurun.")
+            total = sum(float(t["ratio"]) for t in ts)
+            if total > 1 + 1e-9:
+                raise ValueError(f"{df.at[row, self.ref_col]}: aynı işten %{total * 100:.0f} aktarılmak isteniyor (en çok %100).")
+            base = df.loc[row].copy()
+            for t in ts:
+                part = base.copy()
+                for q in qty_cols:
+                    part[q] = base[q] * float(t["ratio"])
+                part["Üretim presi"] = normalize_machine(t["target"])
+                extra.append(part)
+            for q in qty_cols:
+                df.at[row, q] = base[q] * (1.0 - total)
+        if extra:
+            df = pd.concat([df, pd.DataFrame(extra)], ignore_index=True)
+
+        engine_sim = CapacityEngine("", "")
+        engine_sim.merged_df = df
+        engine_sim.week_columns = self.week_columns
+        engine_sim.backlog_columns = self.backlog_columns
+        engine_sim.week_month_map = self.week_month_map
+        engine_sim.available_months = self.available_months
+        engine_sim.backlog_month_map = getattr(self, "backlog_month_map", {})
+        engine_sim.extra_qty_columns = getattr(self, "extra_qty_columns", [])
+        return engine_sim.calculate_workload(selected_months=selected_months)
 
     def simulate_transfer(
         self,

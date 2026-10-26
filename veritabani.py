@@ -39,7 +39,9 @@ CREATE TABLE IF NOT EXISTS aktarimlar (
         CHECK (durum IN ('aktif', 'geri alındı')),
     geri_alma_tarihi TEXT,
     mod           TEXT NOT NULL DEFAULT 'yerine' -- yerine: aynı ayın öncekilerin yerine geçer
-        CHECK (mod IN ('yerine', 'ekle'))        -- ekle  : aynı ayın üstüne eklenir (başka müşteri dosyası)
+        CHECK (mod IN ('yerine', 'ekle')),       -- ekle  : aynı ayın üstüne eklenir (başka müşteri dosyası)
+    kullanici     TEXT,                          -- yükleyen: Windows kullanıcısı @ bilgisayar
+    geri_alan     TEXT                           -- geri alan kullanıcı
 );
 
 CREATE TABLE IF NOT EXISTS siparisler (
@@ -128,6 +130,52 @@ WHERE k.aktarim_id IS NULL
 """
 
 
+def current_user() -> str:
+    """İşlem kaydı için: Windows kullanıcı adı @ bilgisayar adı (ör. MONSTER@MONSTERPC)."""
+    import getpass
+    import socket
+    try:
+        user = getpass.getuser()
+    except Exception:
+        user = os.environ.get("USERNAME") or os.environ.get("USER") or "?"
+    try:
+        host = socket.gethostname()
+    except Exception:
+        host = os.environ.get("COMPUTERNAME") or "?"
+    return f"{user}@{host}"
+
+
+def normalize_firma(value) -> str:
+    """Firma adını tek tip yapar: Türkçe büyük harf + tek boşluk. 'Valeo  bursa ' -> 'VALEO BURSA'."""
+    if value is None:
+        return ""
+    s = str(value)
+    if s.strip().lower() in ("nan", "none"):
+        return ""
+    s = " ".join(s.split())
+    return s.replace("i", "İ").replace("ı", "I").upper()
+
+
+def _normalize_firms_in_db(con):
+    """Eski kayıtlarda farklı yazılmış firma adlarını tek tipe çevirir (aynı yüklemede çakışırsa adetleri birleştirir)."""
+    for table, key_cols, sum_cols in (("siparisler", ("aktarim_id", "urun_kodu", "yil", "hafta"), ("adet",)),
+                                      ("backlog", ("aktarim_id", "urun_kodu", "yil", "ay"), ("backlog_adet", "stok_adet"))):
+        rows = con.execute(f"SELECT id, firma FROM {table}").fetchall()
+        bad = [(rid, f, normalize_firma(f)) for rid, f in rows if (f or "") != normalize_firma(f)]
+        for rid, old, new in bad:
+            try:
+                con.execute(f"UPDATE {table} SET firma=? WHERE id=?", (new, rid))
+            except sqlite3.IntegrityError:
+                # aynı yüklemede normalize hali zaten var -> adetleri ona ekle, bu satırı kaldır
+                r = con.execute(f"SELECT {', '.join(key_cols)}, {', '.join(sum_cols)} FROM {table} WHERE id=?",
+                                (rid,)).fetchone()
+                keys, vals = r[:len(key_cols)], r[len(key_cols):]
+                where = " AND ".join(f"{c} IS ?" for c in key_cols) + " AND firma=?"
+                sets = ", ".join(f"{c} = {c} + ?" for c in sum_cols)
+                con.execute(f"UPDATE {table} SET {sets} WHERE {where}", (*vals, *keys, new))
+                con.execute(f"DELETE FROM {table} WHERE id=?", (rid,))
+
+
 def hafta_yili(yil: int, ay_no: int, hafta: int) -> int:
     """Haftanın ait olduğu yıl. Aralık'taki W1, W2 ... bir sonraki yılın; Ocak'taki W52, W53 bir önceki yılın haftasıdır."""
     if ay_no == 12 and hafta < 10:
@@ -187,12 +235,129 @@ def create_empty_db(path: str) -> str:
         # önceki sürümde 'mod' yoktu: eski yüklemeler 'yerine' sayılır
         if "mod" not in _columns(con, "aktarimlar"):
             con.execute("ALTER TABLE aktarimlar ADD COLUMN mod TEXT NOT NULL DEFAULT 'yerine'")
+        for col in ("kullanici", "geri_alan"):     # önceki sürümde kim yaptı bilgisi yoktu
+            if col not in _columns(con, "aktarimlar"):
+                con.execute(f"ALTER TABLE aktarimlar ADD COLUMN {col} TEXT")
         con.executescript(SCHEMA_VIEWS)
+        _normalize_firms_in_db(con)
         con.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
         con.commit()
     finally:
         con.close()
     return path
+
+
+def check_db(path: str):
+    """Dosya geçerli bir SQLite veritabanı mı? Sorun varsa açıklama döner, yoksa None.
+    (Dosya yoksa None döner – o durum ayrıca ele alınır.)"""
+    if not os.path.exists(path):
+        return None
+    if os.path.isdir(path):
+        return "Seçilen yol bir klasör, veritabanı dosyası değil."
+    try:
+        size = os.path.getsize(path)
+        if size:
+            with open(path, "rb") as f:
+                head = f.read(16)
+            if head != b"SQLite format 3\x00":
+                return ("Bu dosya geçerli bir veritabanı değil (SQLite dosyası değil). Yanlış dosya seçilmiş "
+                        "veya dosya bozulmuş olabilir. Yedekten geri yükleyin ya da doğru .db dosyasını seçin.")
+        con = sqlite3.connect(path, timeout=15)
+        try:
+            con.execute("SELECT count(*) FROM sqlite_master").fetchone()
+        finally:
+            con.close()
+    except sqlite3.DatabaseError as e:
+        return f"Veritabanı açılamadı ({e}). Dosya bozulmuş olabilir; yedekten geri yükleyin."
+    except OSError as e:
+        return f"Dosya okunamadı: {e}"
+    return None
+
+
+def is_network_path(path: str) -> bool:
+    """Veritabanı ağ klasöründe mi? (\\\\sunucu\\paylaşım veya ağ sürücüsü)"""
+    raw = str(path).strip()
+    if raw.startswith("\\\\") or raw.startswith("//"):     # \\sunucu\paylaşım (UNC) – yazıldığı haliyle kontrol
+        return True
+    p = os.path.abspath(path)
+    if p.startswith("\\\\") or p.startswith("//"):
+        return True
+    if os.name == "nt":
+        try:
+            import ctypes
+            root = os.path.splitdrive(p)[0] + "\\"
+            return ctypes.windll.kernel32.GetDriveTypeW(root) == 4   # DRIVE_REMOTE
+        except Exception:
+            return False
+    return False
+
+
+# --- Aynı veritabanını kimler açmış? (yanında küçük bir işaret dosyası) ---
+SESSION_MAX_AGE_H = 12
+
+
+def _sessions_file(path: str) -> str:
+    return os.path.abspath(path) + ".kullanimda"
+
+
+def _read_sessions(path: str) -> list:
+    import json
+    try:
+        with open(_sessions_file(path), encoding="utf-8") as f:
+            data = json.load(f)
+        return data if isinstance(data, list) else []
+    except Exception:
+        return []
+
+
+def _write_sessions(path: str, sessions: list):
+    import json
+    f = _sessions_file(path)
+    try:
+        if sessions:
+            with open(f, "w", encoding="utf-8") as fh:
+                json.dump(sessions, fh, ensure_ascii=False)
+        elif os.path.exists(f):
+            os.remove(f)
+    except Exception:
+        pass   # işaret dosyası yazılamazsa uygulama yine çalışır
+
+
+def _fresh(sessions: list) -> list:
+    now = datetime.now()
+    out = []
+    for s in sessions:
+        try:
+            if (now - datetime.fromisoformat(s["zaman"])).total_seconds() < SESSION_MAX_AGE_H * 3600:
+                out.append(s)
+        except Exception:
+            pass
+    return out
+
+
+def _me() -> dict:
+    return {"kullanici": current_user(), "pid": os.getpid()}
+
+
+def other_sessions(path: str) -> list:
+    """Bu veritabanını şu an açık tutan DİĞER oturumlar (12 saatten eskiler sayılmaz)."""
+    me = _me()
+    return [s for s in _fresh(_read_sessions(path))
+            if not (s.get("kullanici") == me["kullanici"] and s.get("pid") == me["pid"])]
+
+
+def register_session(path: str):
+    me = _me()
+    sessions = [s for s in _fresh(_read_sessions(path))
+                if not (s.get("kullanici") == me["kullanici"] and s.get("pid") == me["pid"])]
+    sessions.append({**me, "zaman": datetime.now().isoformat(timespec="seconds")})
+    _write_sessions(path, sessions)
+
+
+def unregister_session(path: str):
+    me = _me()
+    _write_sessions(path, [s for s in _fresh(_read_sessions(path))
+                           if not (s.get("kullanici") == me["kullanici"] and s.get("pid") == me["pid"])])
 
 
 def is_synced_folder(path: str) -> bool:
@@ -308,15 +473,15 @@ def save_manual_orders(path: str, changes, aciklama: str = "") -> list:
                 ay_no = AY_ADLARI.index(ay) + 1
                 cur = con.execute(
                     "INSERT INTO aktarimlar(tarih, dosya_adi, sayfa, yil, ay, ay_no, haftalar, siparis_satir, "
-                    "backlog_satir, mod) VALUES (?,?,?,?,?,?,?,?,0,'ekle')",
+                    "backlog_satir, mod, kullanici) VALUES (?,?,?,?,?,?,?,?,0,'ekle',?)",
                     (now, MANUAL_FILE, aciklama or None, yil, ay, ay_no,
                      ",".join(str(h) for h in sorted({int(r["hafta"]) for r in rows})),
-                     sum(1 for r in rows if float(r["adet"]) > 0)))
+                     sum(1 for r in rows if float(r["adet"]) > 0), current_user()))
                 aid = cur.lastrowid
                 con.executemany(
                     "INSERT INTO siparisler(aktarim_id, urun_kodu, firma, yil, hafta, hafta_yili, ay, adet) "
                     "VALUES (?,?,?,?,?,?,?,?)",
-                    [(aid, r["urun_kodu"], r.get("firma") or "", yil, int(r["hafta"]),
+                    [(aid, r["urun_kodu"], normalize_firma(r.get("firma")), yil, int(r["hafta"]),
                       hafta_yili(yil, ay_no, int(r["hafta"])), ay, float(r["adet"])) for r in rows])
                 ids.append(aid)
     finally:
@@ -330,12 +495,13 @@ def list_imports(path: str):
     try:
         rows = con.execute("""
             SELECT a.id, a.tarih, a.dosya_adi, a.sayfa, a.yil, a.ay, a.haftalar,
-                   a.siparis_satir, a.backlog_satir, a.durum, a.mod,
+                   a.siparis_satir, a.backlog_satir, a.durum, a.mod, a.kullanici, a.geri_alan, a.geri_alma_tarihi,
                    CASE WHEN g.id IS NULL THEN 0 ELSE 1 END AS gecerli
             FROM aktarimlar a LEFT JOIN gecerli_aktarimlar g ON g.id = a.id
             ORDER BY a.id DESC""").fetchall()
         cols = ["id", "tarih", "dosya_adi", "sayfa", "yil", "ay", "haftalar",
-                "siparis_satir", "backlog_satir", "durum", "mod", "gecerli"]
+                "siparis_satir", "backlog_satir", "durum", "mod", "kullanici", "geri_alan", "geri_alma_tarihi",
+                "gecerli"]
         return [dict(zip(cols, r)) for r in rows]
     finally:
         con.close()
@@ -345,9 +511,9 @@ def undo_import(path: str, aktarim_id: int):
     """Yüklemeyi geri alır (veri silinmez, yükleme 'geri alındı' olur; varsa bir önceki yükleme geçerli olur)."""
     con = connect(path)
     try:
-        cur = con.execute("UPDATE aktarimlar SET durum='geri alındı', geri_alma_tarihi=? "
+        cur = con.execute("UPDATE aktarimlar SET durum='geri alındı', geri_alma_tarihi=?, geri_alan=? "
                           "WHERE id=? AND durum='aktif'",
-                          (datetime.now().strftime("%Y-%m-%d %H:%M:%S"), aktarim_id))
+                          (datetime.now().strftime("%Y-%m-%d %H:%M:%S"), current_user(), aktarim_id))
         con.commit()
         return cur.rowcount == 1
     finally:

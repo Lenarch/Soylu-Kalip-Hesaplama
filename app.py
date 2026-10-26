@@ -20,12 +20,13 @@ from matplotlib.figure import Figure
 from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg, NavigationToolbar2Tk
 
 from capacity_engine import CapacityEngine, normalize_machine, normalize_code
-from veritabani import (create_empty_db, table_counts, list_imports, undo_import, is_synced_folder,
+from veritabani import (create_empty_db, table_counts, list_imports, undo_import, is_synced_folder, check_db,
+                        is_network_path, other_sessions, register_session, unregister_session,
                         load_operations, save_operations, OP_COLUMNS,
                         load_valid_orders, save_manual_orders, AY_ADLARI)
 from excel_aktar import (sheet_names, parse_plan, check_conflicts, import_plan, parse_operations, OP_SHEET_DEFAULT,
-                         fold, week_month_problem)
-from veritabani import hafta_yili
+                         fold, week_month_problem, XML_PROTECTED)
+from veritabani import hafta_yili, normalize_firma
 
 APP_TITLE = "Soylu Makine – Pres Kapasite Hesaplama"
 DEFAULT_DB_NAME = "kapasite.db"
@@ -153,18 +154,27 @@ class DataTable(ctk.CTkFrame):
         self.tree.tag_configure("over", background="#f8d4d4")
         self.tree.tag_configure("warn", background="#fbe9c8")
         self.tree.tag_configure("total", background="#e4e9f0", font=("Segoe UI", 10, "bold"))
+        self.tree.tag_configure("muted", foreground="#9a9a9a")
+        self.tree.tag_configure("moved", background="#dbe8fb")
         self._df = None
+        self._hide = []
         self._total_row = None
         self._tag_func = None
         self._sort_state = {}
 
-    def show(self, df: pd.DataFrame, tag_func=None, total_row: dict = None):
+    def show(self, df: pd.DataFrame, tag_func=None, total_row: dict = None, hide=None):
+        """hide: tabloda tutulan ama ekranda gösterilmeyen sütunlar (ör. iş numarası)."""
         self._df = df.reset_index(drop=True)
         self._tag_func = tag_func
         self._total_row = total_row
+        self._hide = list(hide or [])
         cols = list(self._df.columns)
         self.tree.delete(*self.tree.get_children())
+        # Önce "hepsini göster"e dön: eski görünümün sütun adları yeni sütunlarda yoksa Tk hata verir
+        self.tree["displaycolumns"] = "#all"
         self.tree["columns"] = cols
+        if self._hide:
+            self.tree["displaycolumns"] = [c for c in cols if c not in self._hide]
         for c in cols:
             self.tree.heading(c, text=c, command=lambda c=c: self._sort(c))
             width = max(90, min(260, len(str(c)) * 9))
@@ -190,8 +200,30 @@ class DataTable(ctk.CTkFrame):
         self._df = self._df.sort_values(col, ascending=asc, kind="mergesort").reset_index(drop=True)
         self._render()
 
+    def selected_records(self) -> list:
+        """Seçili satırlar (toplam satırı hariç), tablodaki verinin sözlükleri olarak."""
+        if self._df is None:
+            return []
+        out = []
+        for item in self.tree.selection():
+            i = self.tree.index(item)
+            if i < len(self._df):
+                out.append(self._df.iloc[i].to_dict())
+        return out
+
+    def select_where(self, col, value):
+        """col == value olan ilk satırı seçip görünür yapar."""
+        if self._df is None or col not in self._df.columns:
+            return
+        hits = self._df.index[self._df[col] == value]
+        if len(hits):
+            item = self.tree.get_children()[int(hits[0])]
+            self.tree.selection_set(item)
+            self.tree.see(item)
+
     def clear(self):
         self.tree.delete(*self.tree.get_children())
+        self.tree["displaycolumns"] = "#all"   # önce sıfırla, sonra sütunları kaldır (yoksa Tk hata verir)
         self.tree["columns"] = []
         self._df = None           # başlığa tıklanınca eski veri geri gelmesin
         self._total_row = None
@@ -285,6 +317,8 @@ class App(ctk.CTk):
         self.minsize(1100, 680)
 
         self.report_callback_exception = self._show_exception
+        self.protocol("WM_DELETE_WINDOW", self._on_close)
+        self.session_db = None   # bu oturumun "açık" olarak işaretlediği veritabanı
         self.settings = load_settings()
         self.engine: CapacityEngine = None
         self.summary: pd.DataFrame = None       # kapasite eklenmiş güncel özet
@@ -308,6 +342,28 @@ class App(ctk.CTk):
         self.db_entry.insert(0, db)
         self._show_db_info()
         self._refresh_imports()
+
+    def _on_close(self):
+        if self.session_db:
+            unregister_session(self.session_db)
+        self.destroy()
+
+    def _claim_session(self, db):
+        """Bu veritabanını 'açık' olarak işaretle; başka biri açık tutuyorsa uyar."""
+        if self.session_db and os.path.abspath(self.session_db) != os.path.abspath(db):
+            unregister_session(self.session_db)
+        others = other_sessions(db)
+        register_session(db)
+        first_time = os.path.abspath(self.session_db or "") != os.path.abspath(db)
+        self.session_db = db
+        if others and first_time:
+            liste = "\n".join(f"  • {s.get('kullanici')} (açılış: {s.get('zaman', '').replace('T', ' ')})" for s in others)
+            messagebox.showwarning(
+                "Veritabanı başka yerde de açık",
+                f"Bu veritabanı şu anda başka bir yerde de açık görünüyor:\n{liste}\n\n"
+                "Aynı anda iki kişi yükleme / düzenleme yaparsa değişiklikler birbirini etkileyebilir. "
+                "Mümkünse diğer kişiyle haberleşin; yalnızca bakıyorsanız sorun yok.\n\n"
+                "(Bilgisayar kapanmadan önce program kapatılmadıysa bu uyarı yanlış olabilir; 12 saat sonra kendiliğinden kalkar.)")
 
     def _show_exception(self, exc_type, exc, tb):
         text = "".join(traceback.format_exception(exc_type, exc, tb))
@@ -351,6 +407,8 @@ class App(ctk.CTk):
         self.status.pack(side="bottom", fill="x", padx=14, pady=(0, 6))
 
     def _open_ops(self):
+        if self._db_problem():
+            return
         db = self._db_path()
         if not db:
             messagebox.showwarning("Eksik", "Önce bir veritabanı seçin veya 'Yeni DB oluştur'.")
@@ -363,6 +421,8 @@ class App(ctk.CTk):
         OpsWindow(self, db)
 
     def _open_orders(self):
+        if self._db_problem():
+            return
         db = self._db_path()
         if not db or not os.path.exists(db):
             messagebox.showwarning("Veritabanı yok", "Önce bir veritabanı seçin ve plan Excel'ini aktarın.")
@@ -372,10 +432,22 @@ class App(ctk.CTk):
     def _db_path(self) -> str:
         return self.db_entry.get().strip()
 
+    def _db_problem(self, show=True):
+        """Seçili dosya bozuk / veritabanı değilse mesaj gösterir ve True döner."""
+        problem = check_db(self._db_path()) if self._db_path() else None
+        if problem and show:
+            messagebox.showerror("Veritabanı sorunu", problem)
+        return bool(problem)
+
     def _show_db_info(self):
         path = self._db_path()
         if not path or not os.path.exists(path):
-            self.db_info.configure(text="Dosya bulunamadı – 'Yeni DB oluştur' ile boş veritabanı oluşturabilirsiniz.")
+            self.db_info.configure(text="Dosya bulunamadı – 'Yeni DB oluştur' ile boş veritabanı oluşturabilirsiniz.",
+                                   text_color="#555")
+            return
+        problem = check_db(path)
+        if problem:
+            self.db_info.configure(text="✖ " + problem, text_color=COLOR_OVER, justify="left")
             return
         try:
             c = table_counts(path)
@@ -384,13 +456,19 @@ class App(ctk.CTk):
             return
         parts = [f"{t}: {'tablo yok' if n is None else n}" for t, n in c.items()]
         text = "Kayıt sayıları →  " + "   |   ".join(parts)
-        if is_synced_folder(path):
+        warnings = []
+        others = other_sessions(path)
+        if others:
+            warnings.append("⚠ Şu anda başka yerde de açık: " + ", ".join(o.get("kullanici", "?") for o in others))
+        if is_network_path(path):
+            warnings.append("⚠ Veritabanı AĞ klasöründe: aynı anda birden fazla kişi kullanırsa çakışma / bozulma "
+                            "riski var. Tek kişi kullanacaksa yerel bir klasöre (ör. C:\\SoyluKapasite) alın.")
+        elif is_synced_folder(path):
             # OneDrive vb. SQLite dosyasını senkron sırasında kilitleyebilir / çakışma kopyası oluşturabilir
-            text += ("\n⚠ Veritabanı OneDrive (senkron) klasöründe: kilitlenme veya kayıt kaybı riski var. "
-                     "OneDrive dışında bir klasöre (ör. C:\\SoyluKapasite) taşımanız önerilir.")
-            self.db_info.configure(text=text, text_color=COLOR_WARN_TEXT, justify="left")
-        else:
-            self.db_info.configure(text=text, text_color="#555", justify="left")
+            warnings.append("⚠ Veritabanı OneDrive (senkron) klasöründe: kilitlenme veya kayıt kaybı riski var. "
+                            "OneDrive dışında bir klasöre (ör. C:\\SoyluKapasite) taşımanız önerilir.")
+        self.db_info.configure(text="\n".join([text] + warnings),
+                               text_color=COLOR_WARN_TEXT if warnings else "#555", justify="left")
 
     def _pick_db(self):
         path = filedialog.askopenfilename(filetypes=[("SQLite veritabanı", "*.db *.sqlite *.sqlite3"), ("Tümü", "*.*")])
@@ -421,6 +499,8 @@ class App(ctk.CTk):
 
     # ---------------- Excel'den aktarma ----------------
     def _open_import(self):
+        if self._db_problem():
+            return
         db = self._db_path()
         if not db:
             messagebox.showwarning("Eksik", "Önce bir veritabanı seçin veya 'Yeni DB oluştur'.")
@@ -460,6 +540,8 @@ class App(ctk.CTk):
             "Durum": ("HESAPTA" if r["gecerli"] else
                       "geri alındı" if r["durum"] != "aktif" else "eski (yenisi var)"),
             "Tür": "üstüne eklendi" if r.get("mod") == "ekle" else "yerine geçti",
+            "Kullanıcı": (r.get("kullanici") or "") + (f"  (geri alan: {r['geri_alan']}, {r.get('geri_alma_tarihi') or ''})"
+                                                     if r.get("geri_alan") else ""),
         } for r in rows])
         n_valid = sum(r["gecerli"] for r in rows)
         self.imports_label.configure(text=f"{len(rows)} yükleme, {n_valid} tanesi hesapta. "
@@ -582,41 +664,111 @@ class App(ctk.CTk):
         self.unmapped_table = DataTable(t)
         self.unmapped_table.pack(fill="both", expand=True)
 
+    SIM_HINT = "1) Makine ve iş seçin   2) Hedef ve miktarı girip 'Listeye Ekle'   3) Sonuç burada görünür."
+
     def _build_sim_tab(self):
+        """Serbest simülasyon: iş iş seç, tanımlı alternatife saat / % / adet olarak aktar,
+        birden çok aktarımı bir senaryoda birlikte gör."""
         t = self.tabs.tab("Simülasyon")
-        ctrl = ctk.CTkFrame(t)
-        ctrl.pack(fill="x", pady=(0, 6))
+        self.sim_transfers = []     # [{"row", "source", "ref", "op", "target", "ratio"}]
+        self.sim_jobs = None        # seçili makinenin iş tablosu (engine.job_list)
+        self.sim_cmp = None         # son karşılaştırma (önce / sonra, kapasiteli)
+        self.sim_scenario = None    # rapor için senaryo listesi
+        self.summary_key = None
 
-        ctk.CTkLabel(ctrl, text="Darboğaz makine:").grid(row=0, column=0, padx=8, pady=8, sticky="w")
-        self.sim_machine = ctk.CTkComboBox(ctrl, values=[""], width=160, command=lambda _: self._update_sim_info())
-        self.sim_machine.grid(row=0, column=1, padx=4)
+        outer = ttk.PanedWindow(t, orient="vertical")
+        outer.pack(fill="both", expand=True)
+        top = ttk.PanedWindow(outer, orient="horizontal")
 
-        ctk.CTkLabel(ctrl, text="Hedef:").grid(row=0, column=2, padx=(16, 4))
-        self.sim_alt = ctk.CTkComboBox(ctrl, values=ALT_COLS, width=140, command=lambda _: self._update_sim_info())
-        self.sim_alt.set(ALT_COLS[0])
-        self.sim_alt.grid(row=0, column=3, padx=4)
+        # ---- 1) İş seçimi ----
+        left = ctk.CTkFrame(top)
+        bar = ctk.CTkFrame(left, fg_color="transparent")
+        bar.pack(fill="x", padx=6, pady=(6, 2))
+        ctk.CTkLabel(bar, text="1) Makine:", font=ctk.CTkFont(weight="bold")).pack(side="left")
+        self.sim_machine = ctk.CTkComboBox(bar, values=[""], width=140, command=lambda _: self._on_sim_machine())
+        self.sim_machine.pack(side="left", padx=6)
+        self.sim_only_movable = ctk.CTkCheckBox(bar, text="Sadece aktarılabilir işler",
+                                                command=self._show_jobs)
+        self.sim_only_movable.pack(side="left", padx=10)
+        # bilgi satırı ayrı satırda: dar pencerede kesilmesin
+        self.sim_info = ctk.CTkLabel(left, text="", anchor="w", justify="left", text_color="#555")
+        self.sim_info.pack(fill="x", padx=8)
 
-        ctk.CTkLabel(ctrl, text="Aktarım oranı:").grid(row=0, column=4, padx=(16, 4))
-        self.sim_pct = ctk.CTkSlider(ctrl, from_=0, to=100, number_of_steps=20, width=200,
-                                     command=lambda v: self.sim_pct_label.configure(text=f"%{v:.0f}"))
-        self.sim_pct.set(30)
-        self.sim_pct.grid(row=0, column=5, padx=4)
-        self.sim_pct_label = ctk.CTkLabel(ctrl, text="%30", width=44)
-        self.sim_pct_label.grid(row=0, column=6)
+        # Form tablodan ÖNCE alta yerleşir: pencere küçülünce form değil tablo daralır.
+        form = ctk.CTkFrame(left, fg_color="transparent")
+        form.pack(side="bottom", fill="x", padx=6, pady=(2, 6))
 
-        self.sim_btn = ctk.CTkButton(ctrl, text="Simüle Et", state="disabled", command=self._run_simulation)
-        self.sim_btn.grid(row=0, column=7, padx=12)
+        self.sim_jobs_table = DataTable(left)
+        self.sim_jobs_table.pack(fill="both", expand=True, padx=6, pady=2)
+        self.sim_jobs_table.tree.bind("<<TreeviewSelect>>", lambda _: self._on_job_select())
 
-        self.sim_info = ctk.CTkLabel(ctrl, text="", anchor="w", text_color="#555")
-        self.sim_info.grid(row=1, column=0, columnspan=8, sticky="w", padx=8, pady=(0, 8))
+        ctk.CTkLabel(form, text="Hedef:").grid(row=0, column=0, sticky="w")
+        self.sim_target = ctk.CTkComboBox(form, values=[""], width=120, state="disabled",
+                                          command=lambda _: self._update_amount_hint())
+        self.sim_target.grid(row=0, column=1, padx=4)
+        ctk.CTkLabel(form, text="Miktar:").grid(row=0, column=2, padx=(10, 2))
+        self.sim_amount = ctk.CTkEntry(form, width=90)
+        self.sim_amount.grid(row=0, column=3, padx=2)
+        self.sim_amount.bind("<KeyRelease>", lambda _: self._update_amount_hint())
+        self.sim_amount.bind("<Return>", lambda _: self._add_transfer())
+        self.sim_unit = ctk.CTkSegmentedButton(form, values=["Saat", "%", "Adet"],
+                                               command=lambda _: self._update_amount_hint())
+        self.sim_unit.set("Saat")
+        self.sim_unit.grid(row=0, column=4, padx=4)
+        # Düğmeler ikinci satırda: dar pencerede de sığsın.
+        ctk.CTkButton(form, text="Kalanın tümü", width=100, fg_color="gray55",
+                      command=self._fill_remaining).grid(row=1, column=2, columnspan=2, sticky="e",
+                                                         padx=2, pady=(4, 0))
+        self.sim_add_btn = ctk.CTkButton(form, text="Listeye Ekle", width=110, state="disabled",
+                                         command=self._add_transfer)
+        self.sim_add_btn.grid(row=1, column=4, sticky="w", padx=4, pady=(4, 0))
+        self.sim_amount_hint = ctk.CTkLabel(form, text="Listeden bir iş seçin.", anchor="w",
+                                            justify="left", text_color="#555")
+        self.sim_amount_hint.grid(row=2, column=0, columnspan=5, sticky="w", pady=(4, 0))
+        top.add(left, weight=3)
 
-        pane = ttk.PanedWindow(t, orient="vertical")
-        pane.pack(fill="both", expand=True)
-        self.sim_chart = ChartPanel(pane)
-        self.sim_chart.message("Makine, hedef ve oranı seçip 'Simüle Et'e basın.")
-        self.sim_table = DataTable(pane)
-        pane.add(self.sim_chart, weight=3)
-        pane.add(self.sim_table, weight=2)
+        # ---- 2) Senaryo ----
+        right = ctk.CTkFrame(top)
+        ctk.CTkLabel(right, text="2) Senaryo – aktarım listesi", font=ctk.CTkFont(weight="bold"),
+                     anchor="w").pack(fill="x", padx=6, pady=(8, 2))
+        btns = ctk.CTkFrame(right, fg_color="transparent")
+        btns.pack(side="bottom", fill="x", padx=6, pady=(2, 6))
+        self.sim_list_table = DataTable(right)
+        self.sim_list_table.pack(fill="both", expand=True, padx=6, pady=2)
+        ctk.CTkButton(btns, text="Seçileni Sil", width=110, fg_color=COLOR_OVER, hover_color="#b03636",
+                      command=self._remove_transfer).pack(side="left")
+        ctk.CTkButton(btns, text="Tümünü Temizle", width=120, fg_color="gray55",
+                      command=self._clear_transfers).pack(side="left", padx=6)
+        self.sim_btn = ctk.CTkButton(btns, text="Yeniden Hesapla", width=120, state="disabled",
+                                     command=lambda: self._run_simulation(force=True))
+        self.sim_btn.pack(side="right")
+        top.add(right, weight=2)
+        outer.add(top, weight=3)
+
+        # ---- 3) Sonuç ----
+        res = ctk.CTkFrame(outer)
+        rbar = ctk.CTkFrame(res, fg_color="transparent")
+        rbar.pack(fill="x", padx=6, pady=(6, 2))
+        ctk.CTkLabel(rbar, text="3) Sonuç", font=ctk.CTkFont(weight="bold")).pack(side="left")
+        ctk.CTkLabel(rbar, text="Tablo:").pack(side="left", padx=(16, 4))
+        self.sim_view = ctk.CTkSegmentedButton(rbar, values=["Toplam", "Aylık", "Haftalık"],
+                                               command=lambda _: self._show_sim_table())
+        self.sim_view.set("Toplam")
+        self.sim_view.pack(side="left")
+        self.sim_only_changed = ctk.CTkCheckBox(rbar, text="Sadece etkilenen makineler",
+                                                command=self._show_sim_table)
+        self.sim_only_changed.select()
+        self.sim_only_changed.pack(side="left", padx=12)
+        self.sim_summary = ctk.CTkLabel(res, text=self.SIM_HINT, anchor="w", justify="left", text_color="#555")
+        self.sim_summary.pack(fill="x", padx=8)
+        rpane = ttk.PanedWindow(res, orient="horizontal")
+        rpane.pack(fill="both", expand=True, padx=4, pady=4)
+        self.sim_chart = ChartPanel(rpane)
+        self.sim_chart.message("Senaryoya aktarım ekleyince sonuç burada görünür.")
+        self.sim_table = DataTable(rpane)
+        rpane.add(self.sim_chart, weight=1)
+        rpane.add(self.sim_table, weight=1)
+        outer.add(res, weight=4)
 
     def _build_capacity_tab(self):
         t = self.tabs.tab("Kapasite")
@@ -629,6 +781,11 @@ class App(ctk.CTk):
         ctk.CTkButton(top, text="Tümüne uygula", width=120, fg_color="gray55",
                       command=self._apply_default_to_all).pack(side="left", padx=8)
         ctk.CTkButton(top, text="Kaydet ve Yeniden Hesapla", command=self._save_capacities).pack(side="right", padx=8)
+        self.cap_dirty_label = ctk.CTkLabel(top, text="", text_color=COLOR_WARN_TEXT,
+                                            font=ctk.CTkFont(weight="bold"))
+        self.cap_dirty_label.pack(side="right", padx=8)
+        self._entry_border = self.default_cap_entry.cget("border_color")   # normal çerçeve rengi
+        self.default_cap_entry.bind("<KeyRelease>", lambda _: self._mark_cap_dirty())
         ctk.CTkLabel(t, text="Her makine için HAFTADA kullanılabilir üretim saatini girin "
                              "(ör. 5 gün × 3 vardiya × 7,5 saat × verim). Boş bırakılırsa varsayılan kullanılır. "
                              "Ay kapasitesi = haftalık kapasite × o ayın planda kaç haftası varsa.",
@@ -641,6 +798,8 @@ class App(ctk.CTk):
         self.status.configure(text=text)
 
     def _load_data(self):
+        if self._db_problem():
+            return
         db = self._db_path()
         if not db:
             messagebox.showwarning("Eksik", "Lütfen bir veritabanı dosyası seçin.")
@@ -673,6 +832,7 @@ class App(ctk.CTk):
 
     def _on_loaded_inner(self, eng: CapacityEngine, db):
         self.engine = eng
+        self._claim_session(db)
         self._clear_results()
         self.load_btn.configure(state="normal", text="Verileri Yükle")
         self.settings["db_file"] = db
@@ -765,15 +925,44 @@ class App(ctk.CTk):
             if val:
                 e.insert(0, val)
             e.grid(row=i, column=1, padx=10, pady=2)
+            e.bind("<KeyRelease>", lambda _: self._mark_cap_dirty())
             self.cap_entries[m] = e
+        self._mark_cap_dirty()
+
+    @staticmethod
+    def _cap_changed(txt, saved) -> bool:
+        """Kutudaki yazı kayıtlı değerden farklı mı? (saved None = kayıtlı değer yok)"""
+        txt = txt.strip()
+        if not txt:
+            return saved is not None
+        try:
+            return saved is None or abs(float(txt.replace(",", ".")) - float(saved)) > 1e-9
+        except ValueError:
+            return True
+
+    def _mark_cap_dirty(self):
+        """Kaydedilmemiş kapasite kutularını turuncu çerçeveyle göster, üstte uyarı yaz."""
+        caps = self.settings.get("weekly_capacities", {})
+        n = 0
+        for m, e in self.cap_entries.items():
+            changed = self._cap_changed(e.get(), caps.get(m))
+            e.configure(border_color=COLOR_WARN if changed else self._entry_border)
+            n += changed
+        d = self.default_cap_entry.get()
+        d_changed = bool(d.strip()) and self._cap_changed(d, self.settings.get("default_weekly_capacity"))
+        self.default_cap_entry.configure(border_color=COLOR_WARN if d_changed else self._entry_border)
+        n += d_changed
+        self.cap_dirty_label.configure(
+            text=f"● {n} kaydedilmemiş değişiklik – 'Kaydet ve Yeniden Hesapla'ya basın" if n else "")
 
     def _apply_default_to_all(self):
         val = fmt_input(self._default_cap())
         for e in self.cap_entries.values():
             e.delete(0, "end")
             e.insert(0, val)
+        self._mark_cap_dirty()
 
-    def _read_capacities(self) -> dict:
+    def _read_capacities(self, warn=True) -> dict:
         caps = dict(self.settings.get("weekly_capacities", {}))
         bad = []
         for m, e in self.cap_entries.items():
@@ -785,7 +974,7 @@ class App(ctk.CTk):
                 caps[m] = float(txt)
             except ValueError:
                 bad.append(m)
-        if bad:
+        if bad and warn:
             messagebox.showwarning("Geçersiz değer", "Şu makinelerin kapasitesi sayı değil, atlandı:\n" + ", ".join(bad))
         return caps
 
@@ -793,12 +982,13 @@ class App(ctk.CTk):
         self.settings["default_weekly_capacity"] = self._default_cap()
         self.settings["weekly_capacities"] = self._read_capacities()
         save_settings(self.settings)
+        self._mark_cap_dirty()
         self._set_status("Kapasite ayarları kaydedildi.")
         if self.engine is not None:
             self._recalculate()
 
-    def _capacity_args(self):
-        caps = self._read_capacities() if self.cap_entries else self.settings["weekly_capacities"]
+    def _capacity_args(self, warn=True):
+        caps = self._read_capacities(warn) if self.cap_entries else self.settings["weekly_capacities"]
         return caps, self._default_cap()
 
     # ---------------- Hesaplama ----------------
@@ -825,7 +1015,16 @@ class App(ctk.CTk):
         if self.period_combo.get() not in periods:
             self.period_combo.set(ALL_PERIOD)
         self._draw_load_chart()
+        self.summary_key = self._sim_key(months)
+        # Simülasyon makine listesi: en dolu makine başta (ilk açılışta en dolu makine seçilir)
+        ranked = [m for m in self.summary.sort_values("DOLULUK_%", ascending=False)["Üretim presi"] if m]
+        if ranked:
+            current = self.sim_machine.get()
+            self.sim_machine.configure(values=ranked)
+            if current not in ranked or not getattr(self, "_sim_machine_chosen", False):
+                self.sim_machine.set(ranked[0])
         self._update_sim_info()
+        self._simulate_now(months)   # senaryo varsa yeni ay / kapasiteyle yeniden hesaplanır
         over = (self.summary["DOLULUK_%"] > OVER_LIMIT).sum()
         self._set_status(f"Hesaplandı: {', '.join(months)}  |  {len(self.summary)} makine  |  "
                          f"kapasite üstü: {over}")
@@ -913,93 +1112,420 @@ class App(ctk.CTk):
                                    plot["p"].values.astype(float), title)
 
     # ---------------- Simülasyon ----------------
+    # Senaryo, işin PAYI (0–1) olarak tutulur; saat / adet karşılığı seçili aylara göre her seferinde yeniden hesaplanır.
     def _update_sim_info(self):
-        if self.engine is None:
+        """Makine değişti ya da yeniden hesaplandı: iş listesini ve bilgi satırını yenile."""
+        if self.engine is None or self.summary is None:
             return
-        m, alt = self.sim_machine.get(), self.sim_alt.get()
-        df = self.engine.merged_df
-        jobs = df[df["Üretim presi"] == normalize_machine(m)]
+        months = self._selected_months()
+        m = normalize_machine(self.sim_machine.get())
+        try:
+            self.sim_jobs = self.engine.job_list(m, months)
+        except Exception as e:
+            self.sim_jobs = None
+            self.sim_info.configure(text=f"İşler okunamadı: {e}")
+            return
+        jobs = self.sim_jobs
         if jobs.empty:
             self.sim_info.configure(text="Bu makinede iş yok.")
-            return
-        has_alt = jobs[(jobs[alt] != "") & jobs[alt].notna()]
-        targets = sorted(t for t in has_alt[alt].unique() if t)
-        self.sim_info.configure(text=(
-            f"{m}: {len(jobs)} iş, bunların {len(has_alt)} tanesinin '{alt}' tanımlı "
-            f"(aktarılabilir). Hedef makineler: {', '.join(targets) if targets else '—'}"))
+        else:
+            has_alt = [bool(CapacityEngine.job_targets(r)) for _, r in jobs.iterrows()]
+            n_alt = sum(has_alt)
+            # aktarılabilir = alternatifi var VE seçili aylarda saati var (0 saatlik iş aktarılamaz)
+            n_move = sum(1 for a, h in zip(has_alt, jobs["TOPLAM_SAAT"]) if a and h > 0)
+            row = self.summary[self.summary["Üretim presi"] == m]
+            load = ""
+            if len(row):
+                r = row.iloc[0]
+                load = (f"yük {fmt_num(r['TOPLAM_SAAT'])} sa / kapasite {fmt_num(r['TOPLAM_KAPASİTE'])} sa "
+                        f"(%{fmt_num(r['DOLULUK_%'])})  |  ")
+            self.sim_info.configure(text=f"{load}{len(jobs)} iş  |  alternatifi olan: {n_alt}  |  "
+                                         f"seçili aylarda aktarılabilir: {n_move}")
+        self._show_jobs()
+        self._show_transfers()
 
-    def _run_simulation(self):
+    def _on_sim_machine(self):
+        self._sim_machine_chosen = True    # kullanıcı seçti: yeniden hesapta değiştirme
+        self._update_sim_info()
+
+    def _assigned(self, row) -> float:
+        return sum(t["ratio"] for t in self.sim_transfers if t["row"] == row)
+
+    def _show_jobs(self):
+        jobs = self.sim_jobs
+        keep = [r.get("SATIR") for r in self.sim_jobs_table.selected_records()]
+        if jobs is None or jobs.empty:
+            self.sim_jobs_table.clear()
+            self._on_job_select()
+            return
+        eng = self.engine
+        view = pd.DataFrame({
+            "SATIR": jobs["SATIR"],
+            "Ürün": jobs[eng.ref_col],
+            "Operasyon": jobs.get("OPERASYON STOK KODU", ""),
+            "Firma": jobs.get("FİRMA", ""),
+            "Saniye": jobs["ÜRETİM SANİYE"],
+            "Adet": jobs["TOPLAM_ADET"],
+            "Saat": jobs["TOPLAM_SAAT"],
+            "Aktarılan %": [self._assigned(r) * 100 for r in jobs["SATIR"]],
+            "Alternatifler": [", ".join(CapacityEngine.job_targets(r)) or "—" for _, r in jobs.iterrows()],
+        })
+
+        def tag(r):
+            if r["Aktarılan %"] > 0:
+                return "moved"
+            if r["Saat"] <= 0 or r["Alternatifler"] == "—":
+                return "muted"
+            return ""
+        if self.sim_only_movable.get():   # saati 0 olan veya alternatifi olmayan işleri gizle
+            view = view[(view["Saat"] > 0) & (view["Alternatifler"] != "—")]
+            if view.empty:
+                self.sim_jobs_table.clear()
+                self._on_job_select()
+                return
+        self.sim_jobs_table.show(view, tag_func=tag, hide=["SATIR"])
+        if keep:
+            self.sim_jobs_table.select_where("SATIR", keep[0])
+        self._on_job_select()
+
+    def _selected_job(self):
+        """Seçili iş satırı (engine.job_list tablosundan) ya da None."""
+        recs = self.sim_jobs_table.selected_records()
+        if not recs or self.sim_jobs is None:
+            return None
+        hit = self.sim_jobs[self.sim_jobs["SATIR"] == recs[0]["SATIR"]]
+        return hit.iloc[0] if len(hit) else None
+
+    def _on_job_select(self):
+        job = self._selected_job()
+        if job is None:
+            self.sim_target.configure(values=[""], state="disabled")
+            self.sim_target.set("")
+            self.sim_add_btn.configure(state="disabled")
+            self.sim_amount_hint.configure(text="Listeden bir iş seçin.", text_color="#555")
+            return
+        targets = CapacityEngine.job_targets(job)
+        if not targets:
+            self.sim_target.configure(values=[""], state="disabled")
+            self.sim_target.set("")
+            self.sim_add_btn.configure(state="disabled")
+            self.sim_amount_hint.configure(
+                text=f"{job[self.engine.ref_col]}: REFERANS PRES'te alternatif pres tanımlı değil – aktarılamaz.",
+                text_color=COLOR_WARN_TEXT)
+            return
+        self.sim_target.configure(values=targets, state="readonly")
+        if self.sim_target.get() not in targets:
+            self.sim_target.set(targets[0])
+        if job["TOPLAM_SAAT"] <= 0:
+            self.sim_add_btn.configure(state="disabled")
+            self.sim_amount_hint.configure(
+                text=(f"{job[self.engine.ref_col]}: seçili aylarda saati 0 (sipariş yok ya da fazla stoktan "
+                      "karşılanıyor) – aktarılacak iş yok."), text_color=COLOR_WARN_TEXT)
+            return
+        self.sim_add_btn.configure(state="normal")
+        self._update_amount_hint()
+
+    def _amount_ratio(self, job):
+        """Girilen miktarı işin payına (0–1) çevirir. Boş/geçersizse None."""
+        txt = self.sim_amount.get().strip()
+        if not txt:
+            return None
+        try:
+            v = parse_qty(txt.replace("%", ""))
+        except ValueError:
+            return None
+        unit = self.sim_unit.get()
+        if unit == "%":
+            return v / 100.0
+        if unit == "Adet":
+            return v / job["TOPLAM_ADET"] if job["TOPLAM_ADET"] > 0 else None
+        return v / job["TOPLAM_SAAT"] if job["TOPLAM_SAAT"] > 0 else None
+
+    def _load_text(self, machine, extra_hours=0.0):
+        """'MK178 şu an %30,9' gibi kısa yük bilgisi (eklenecek saatle birlikte)."""
+        row = self.summary[self.summary["Üretim presi"] == machine] if self.summary is not None else []
+        if len(row):
+            h, cap = row.iloc[0]["TOPLAM_SAAT"], row.iloc[0]["TOPLAM_KAPASİTE"]
+        else:   # makinenin kendi işi yok (sadece alternatif olarak geçiyor)
+            caps, default_cap = self._capacity_args()
+            n = sum(1 for w, mm in self.engine.week_month_map.items() if mm in self._selected_months())
+            h, cap = 0.0, caps.get(machine, default_cap) * n
+        if not cap:
+            return f"{machine}: kapasite tanımsız"
+        txt = f"{machine} şu an %{fmt_num(h / cap * 100)}"
+        if extra_hours:
+            txt += f" → bu aktarımla ~%{fmt_num((h + extra_hours) / cap * 100)}"
+        return txt
+
+    def _update_amount_hint(self):
+        job = self._selected_job()
+        if job is None or job["TOPLAM_SAAT"] <= 0 or not CapacityEngine.job_targets(job):
+            return
+        left = max(0.0, 1.0 - self._assigned(job["SATIR"]))
+        rest = (f"Bu işten kalan: %{fmt_num(left * 100)} = {fmt_num(left * job['TOPLAM_SAAT'])} saat "
+                f"= {fmt_num(left * job['TOPLAM_ADET'], 0)} adet")
+        ratio = self._amount_ratio(job)
+        target = self.sim_target.get()
+        if ratio is None:
+            self.sim_amount_hint.configure(text=f"{rest}\n{self._load_text(target)}", text_color="#555")
+            return
+        bad = ratio <= 0 or ratio > left + 1e-9
+        line = (f"= {fmt_num(ratio * job['TOPLAM_SAAT'])} saat = %{fmt_num(ratio * 100)} "
+                f"= {fmt_num(ratio * job['TOPLAM_ADET'], 0)} adet")
+        if bad:
+            line += "   ⚠ kalandan fazla" if ratio > 0 else "   ⚠ 0'dan büyük olmalı"
+        self.sim_amount_hint.configure(
+            text=f"{line}   |   {rest}\n{self._load_text(target, 0 if bad else ratio * job['TOPLAM_SAAT'])}",
+            text_color=COLOR_OVER if bad else "#333")
+
+    def _fill_remaining(self):
+        job = self._selected_job()
+        if job is None:
+            return
+        left = max(0.0, 1.0 - self._assigned(job["SATIR"]))
+        unit = self.sim_unit.get()
+        val = left * 100 if unit == "%" else left * job["TOPLAM_ADET"] if unit == "Adet" else left * job["TOPLAM_SAAT"]
+        self.sim_amount.delete(0, "end")
+        self.sim_amount.insert(0, fmt_input(round(val, 0 if unit == "Adet" else 2)))
+        self._update_amount_hint()
+
+    def _add_transfer(self):
+        job = self._selected_job()
+        if job is None or str(self.sim_add_btn.cget("state")) == "disabled":
+            return
+        target = self.sim_target.get()
+        if target not in CapacityEngine.job_targets(job):
+            messagebox.showwarning("Hedef", "Hedef olarak işin tanımlı alternatiflerinden birini seçin.")
+            return
+        ratio = self._amount_ratio(job)
+        if ratio is None:
+            messagebox.showwarning("Miktar", f"Geçerli bir miktar yazın ({self.sim_unit.get()}).")
+            return
+        left = max(0.0, 1.0 - self._assigned(job["SATIR"]))
+        if ratio <= 0:
+            messagebox.showwarning("Miktar", "Miktar 0'dan büyük olmalı.")
+            return
+        if ratio > left + 1e-9:
+            if left <= 1e-9:
+                messagebox.showwarning("Miktar", "Bu işin tamamı zaten senaryoda aktarılmış.")
+                return
+            if not messagebox.askyesno("Kalandan fazla",
+                                       f"Bu işten en çok %{fmt_num(left * 100)} "
+                                       f"({fmt_num(left * job['TOPLAM_SAAT'])} saat) aktarılabilir.\n\n"
+                                       "Kalanın tamamı aktarılsın mı?"):
+                return
+            ratio = left
+        ref = job[self.engine.ref_col]
+        same = next((t for t in self.sim_transfers if t["row"] == job["SATIR"] and t["target"] == target), None)
+        if same:   # aynı iş + aynı hedef tek satırda toplanır
+            same["ratio"] = min(1.0, same["ratio"] + ratio)
+        else:
+            self.sim_transfers.append({"row": int(job["SATIR"]), "source": job["Üretim presi"], "ref": ref,
+                                       "op": job.get("OPERASYON STOK KODU", ""), "target": target,
+                                       "ratio": ratio})
+        self.sim_amount.delete(0, "end")
+        self._show_jobs()
+        self._run_simulation()
+
+    def _transfers_view(self):
+        """Senaryo listesi: payın seçili aylardaki saat / adet karşılığıyla."""
+        rows = self.engine._row_hours(self._selected_months())[0] if self.sim_transfers else None
+        out = []
+        for i, t in enumerate(self.sim_transfers):
+            h = a = 0.0
+            if rows is not None and t["row"] in rows.index:
+                h = rows.at[t["row"], "TOPLAM_SAAT"] * t["ratio"]
+                a = rows.at[t["row"], "TOPLAM_ADET"] * t["ratio"]
+            out.append({"NO": i, "Kaynak": t["source"], "Ürün": t["ref"], "Operasyon": t["op"],
+                        "Hedef": t["target"], "Pay %": t["ratio"] * 100, "Adet": a, "Saat": h})
+        return pd.DataFrame(out, columns=["NO", "Kaynak", "Ürün", "Operasyon", "Hedef", "Pay %", "Adet", "Saat"])
+
+    def _show_transfers(self):
+        if not self.sim_transfers or self.engine is None:
+            self.sim_list_table.clear()
+            return
+        view = self._transfers_view()
+        total = {"Kaynak": "TOPLAM", "Adet": view["Adet"].sum(), "Saat": view["Saat"].sum()}
+        self.sim_list_table.show(view, total_row=total, hide=["NO"])
+
+    def _remove_transfer(self):
+        recs = [r for r in self.sim_list_table.selected_records() if "NO" in r]
+        if not recs:
+            messagebox.showinfo("Seçim yok", "Silmek için senaryo listesinden bir satır seçin.")
+            return
+        drop = {int(r["NO"]) for r in recs}
+        self.sim_transfers = [t for i, t in enumerate(self.sim_transfers) if i not in drop]
+        self._show_jobs()
+        self._run_simulation()
+
+    def _clear_transfers(self):
+        if not self.sim_transfers:
+            return
+        if not messagebox.askyesno("Temizle", f"Senaryodaki {len(self.sim_transfers)} aktarım silinsin mi?"):
+            return
+        self.sim_transfers = []
+        self._show_jobs()
+        self._run_simulation()
+
+    def _run_simulation(self, force=False):
+        """Senaryoyu hesapla. 'Önce' değerleri güncel ay / kapasite seçimiyle olmalı:
+        değiştiyse önce normal hesap yenilenir (o da sonunda simülasyonu çağırır)."""
         if self.engine is None:
             return
         months = self._selected_months()
         if not months:
             messagebox.showwarning("Ay seçilmedi", "En az bir ay seçin.")
             return
-        # "Önce" ve "Sonra" aynı ay seçimiyle hesaplansın: önce güncel seçimle normal hesabı yenile
-        self._recalculate()
-        if self.summary is None:
+        if force or self.summary is None or self.summary_key != self._sim_key(months):
+            self._recalculate()
             return
-        machine, alt, pct = self.sim_machine.get(), self.sim_alt.get(), float(self.sim_pct.get())
+        self._simulate_now(months)
+
+    def _simulate_now(self, months):
+        self._show_transfers()
+        if not self.sim_transfers:
+            self.sim_cmp = None
+            self.sim_result = None
+            self.sim_scenario = None
+            self.sim_chart.message("Senaryoya aktarım ekleyince sonuç burada görünür.")
+            self.sim_table.clear()
+            self.sim_summary.configure(text=self.SIM_HINT, text_color="#555")
+            return
         try:
-            sim_raw = self.engine.simulate_transfer(machine, pct, alt, months)
             caps, default_cap = self._capacity_args()
-            after = CapacityEngine.apply_capacity(sim_raw, months, caps, default_cap, self.engine.week_month_map)
+            raw = self.engine.simulate_plan(self.sim_transfers, months)
+            after = CapacityEngine.apply_capacity(raw, months, caps, default_cap, self.engine.week_month_map)
         except Exception as e:
             messagebox.showerror("Simülasyon hatası", f"{type(e).__name__}: {e}\n\n{traceback.format_exc()[-800:]}")
             return
 
-        before = self.summary[["Üretim presi", "TOPLAM_SAAT", "TOPLAM_KAPASİTE", "DOLULUK_%"]]
-        after = after[["Üretim presi", "TOPLAM_SAAT", "TOPLAM_KAPASİTE", "DOLULUK_%"]]
-        cmp_df = before.merge(after, on="Üretim presi", how="outer", suffixes=("_ÖNCE", "_SONRA"))
-        cmp_df["TOPLAM_KAPASİTE"] = cmp_df["TOPLAM_KAPASİTE_ÖNCE"].fillna(cmp_df["TOPLAM_KAPASİTE_SONRA"])
-        cmp_df[["TOPLAM_SAAT_ÖNCE", "TOPLAM_SAAT_SONRA"]] = cmp_df[["TOPLAM_SAAT_ÖNCE", "TOPLAM_SAAT_SONRA"]].fillna(0)
-        cap = cmp_df["TOPLAM_KAPASİTE"].replace(0, np.nan)
-        cmp_df["DOLULUK_%_ÖNCE"] = cmp_df["TOPLAM_SAAT_ÖNCE"] / cap * 100
-        cmp_df["DOLULUK_%_SONRA"] = cmp_df["TOPLAM_SAAT_SONRA"] / cap * 100
-        cmp_df["FARK"] = cmp_df["TOPLAM_SAAT_SONRA"] - cmp_df["TOPLAM_SAAT_ÖNCE"]
-
-        view = pd.DataFrame({
-            "Makine": cmp_df["Üretim presi"].replace("", NO_MACHINE),
-            "Önce (saat)": cmp_df["TOPLAM_SAAT_ÖNCE"],
-            "Sonra (saat)": cmp_df["TOPLAM_SAAT_SONRA"],
-            "Fark (saat)": cmp_df["FARK"],
-            "Kapasite (saat)": cmp_df["TOPLAM_KAPASİTE"],
-            "Önce %": cmp_df["DOLULUK_%_ÖNCE"],
-            "Sonra %": cmp_df["DOLULUK_%_SONRA"],
-        })
-        changed = view[view["Fark (saat)"].abs() > 1e-9].sort_values("Fark (saat)")
-        self.sim_result = view.copy()
-        self.sim_result.insert(0, "Senaryo", f"{machine} → {alt} %{pct:.0f}")
-        self.sim_result.insert(1, "Aylar", ", ".join(months))
+        weeks = self._active_weeks(self.summary, months)
+        mcols = [m for m in months if f"{m}_Saat" in self.summary.columns]
+        hcols = (["TOPLAM_SAAT"] + [f"{m}_Saat" for m in mcols] + [f"{w}_Saat" for w in weeks])
+        kcols = ["TOPLAM_KAPASİTE", "HAFTALIK_KAPASİTE"] + [f"{m}_Kapasite" for m in mcols]
+        b = self.summary[["Üretim presi"] + hcols + kcols]
+        a = after[["Üretim presi"] + hcols + kcols]
+        cmp_df = b.merge(a, on="Üretim presi", how="outer", suffixes=("_Ö", "_S"))
+        for c in hcols:
+            cmp_df[[f"{c}_Ö", f"{c}_S"]] = cmp_df[[f"{c}_Ö", f"{c}_S"]].fillna(0)
+        for c in kcols:   # kapasite önce/sonra aynı; makine sadece bir tarafta varsa diğerinden al
+            cmp_df[c] = cmp_df[f"{c}_Ö"].fillna(cmp_df[f"{c}_S"])
+        cmp_df["FARK"] = cmp_df["TOPLAM_SAAT_S"] - cmp_df["TOPLAM_SAAT_Ö"]
+        self.sim_cmp = {"df": cmp_df, "months": mcols, "weeks": weeks}
         self.sim_key = self._sim_key(months)
 
+        self._show_sim_table()
+        changed = cmp_df[cmp_df["FARK"].abs() > 1e-9].sort_values("FARK")
+        names = changed["Üretim presi"].replace("", NO_MACHINE).tolist()
         if changed.empty:
-            self.sim_chart.message(f"{machine} için '{alt}' tanımlı iş yok – değişiklik olmadı.")
-            self.sim_table.show(view, tag_func=lambda r: load_tag(r["Sonra %"]))
+            self.sim_chart.message("Senaryodaki aktarımların seçili aylarda saati yok – değişiklik olmadı.")
+        else:
+            self.sim_chart.compare_chart(names, changed["TOPLAM_SAAT_Ö"].values, changed["TOPLAM_SAAT_S"].values,
+                                         changed["TOPLAM_KAPASİTE"].values,
+                                         f"Senaryo ({len(self.sim_transfers)} aktarım) – etkilenen makineler")
+        self._sim_summary_text(changed, weeks)
+
+        # Excel raporu için
+        self.sim_result = self._sim_view_df("Toplam", only_changed=False)
+        self.sim_result.insert(0, "Aylar", ", ".join(months))
+        sc = self._transfers_view().drop(columns=["NO"])
+        sc.insert(0, "Aylar", ", ".join(months))
+        self.sim_scenario = sc
+        moved = changed.loc[changed["FARK"] > 0, "FARK"].sum()
+        self._set_status(f"Simülasyon: {len(self.sim_transfers)} aktarım, {fmt_num(moved)} saat taşındı.")
+
+    def _sim_summary_text(self, changed, weeks):
+        moved = changed.loc[changed["FARK"] > 0, "FARK"].sum()
+        parts = []
+        for _, r in changed.iterrows():
+            cap = r["TOPLAM_KAPASİTE"]
+            if cap:
+                parts.append(f"{r['Üretim presi'] or NO_MACHINE}: %{fmt_num(r['TOPLAM_SAAT_Ö'] / cap * 100)} → "
+                             f"%{fmt_num(r['TOPLAM_SAAT_S'] / cap * 100)}")
+        text = f"{len(self.sim_transfers)} aktarım, toplam {fmt_num(moved)} saat taşındı.   " + "   ".join(parts)
+        # Yeni taşan haftalar: önce kapasite içindeydi, aktarımdan sonra aşıyor
+        warn = []
+        for _, r in changed[changed["FARK"] > 0].iterrows():
+            wcap = r["HAFTALIK_KAPASİTE"]
+            if not wcap:
+                continue
+            over = [w for w in weeks if r[f"{w}_Saat_S"] > wcap + 1e-9 >= r[f"{w}_Saat_Ö"]]
+            if over:
+                warn.append(f"{r['Üretim presi']}: {', '.join(over[:6])}{' …' if len(over) > 6 else ''}")
+        if warn:
+            text += "\n⚠ Aktarımla haftalık kapasiteyi aşmaya başlayan: " + "   ".join(warn)
+        self.sim_summary.configure(text=text, text_color=COLOR_WARN_TEXT if warn else "#333")
+
+    def _sim_view_df(self, mode, only_changed=True):
+        c = self.sim_cmp
+        df = c["df"]
+        pct = lambda h, k: (h / k.replace(0, np.nan)) * 100
+        view = pd.DataFrame({"Makine": df["Üretim presi"].replace("", NO_MACHINE)})
+        if mode == "Aylık":
+            for m in c["months"]:
+                view[f"{m} önce"] = df[f"{m}_Saat_Ö"]
+                view[f"{m} sonra"] = df[f"{m}_Saat_S"]
+                view[f"{m} kap."] = df[f"{m}_Kapasite"]
+                view[f"{m} önce %"] = pct(df[f"{m}_Saat_Ö"], df[f"{m}_Kapasite"])
+                view[f"{m} sonra %"] = pct(df[f"{m}_Saat_S"], df[f"{m}_Kapasite"])
+            view["Fark (saat)"] = df["FARK"]
+        elif mode == "Haftalık":
+            view["Haftalık kap."] = df["HAFTALIK_KAPASİTE"]
+            for w in c["weeks"]:
+                view[f"{w} önce"] = df[f"{w}_Saat_Ö"]
+                view[f"{w} sonra"] = df[f"{w}_Saat_S"]
+                view[f"{w} sonra %"] = pct(df[f"{w}_Saat_S"], df["HAFTALIK_KAPASİTE"])
+            view["Fark (saat)"] = df["FARK"]
+        else:
+            view["Önce (saat)"] = df["TOPLAM_SAAT_Ö"]
+            view["Sonra (saat)"] = df["TOPLAM_SAAT_S"]
+            view["Fark (saat)"] = df["FARK"]
+            view["Kapasite (saat)"] = df["TOPLAM_KAPASİTE"]
+            view["Önce %"] = pct(df["TOPLAM_SAAT_Ö"], df["TOPLAM_KAPASİTE"])
+            view["Sonra %"] = pct(df["TOPLAM_SAAT_S"], df["TOPLAM_KAPASİTE"])
+        moved = view["Fark (saat)"].abs() > 1e-9
+        first = view[moved].sort_values("Fark (saat)")
+        rest = view[~moved]
+        if not only_changed:
+            sort_col = "Sonra (saat)" if "Sonra (saat)" in view.columns else "Makine"
+            return pd.concat([first, rest.sort_values(sort_col, ascending=sort_col == "Makine")])
+        return first
+
+    def _show_sim_table(self):
+        if not self.sim_cmp:
             return
-        self.sim_chart.compare_chart(changed["Makine"].tolist(), changed["Önce (saat)"].values,
-                                     changed["Sonra (saat)"].values, changed["Kapasite (saat)"].values,
-                                     f"{machine} → {alt}  (%{pct:.0f} aktarım)  – etkilenen makineler")
-        rest = view.drop(changed.index).sort_values("Sonra (saat)", ascending=False)
-        self.sim_table.show(pd.concat([changed, rest]), tag_func=lambda r: load_tag(r["Sonra %"]))
-        moved = changed.loc[changed["Fark (saat)"] > 0, "Fark (saat)"].sum()
-        self._set_status(f"Simülasyon: {machine} makinesinden {fmt_num(moved)} saat aktarıldı.")
+        mode = self.sim_view.get() or "Toplam"
+        view = self._sim_view_df(mode, only_changed=bool(self.sim_only_changed.get()))
+        pcols = [c for c in view.columns if c.endswith("sonra %") or c == "Sonra %"]
+        tag = lambda r: load_tag(max([r[c] for c in pcols if pd.notna(r[c])], default=np.nan))
+        self.sim_table.show(view, tag_func=tag)
 
     # ---------------- Excel ----------------
     def _sim_key(self, months):
-        """Simülasyonun geçerli olduğu koşullar: aylar + kapasite ayarları + yüklü veri."""
-        caps, default_cap = self.settings.get("weekly_capacities", {}), self._default_cap()
+        """Simülasyonun geçerli olduğu koşullar: aylar + kapasite ayarları + yüklü veri.
+        Kapasite, hesapla AYNI kaynaktan okunur (kutulara yazılmış, henüz kaydedilmemiş değerler dahil)."""
+        caps, default_cap = self._capacity_args(warn=False)
         return (tuple(months), json.dumps(caps, sort_keys=True), default_cap, id(self.engine))
 
     def _clear_results(self):
         """Veri yeniden yüklenince eski hesap / simülasyon sonuçlarını ekrandan ve hafızadan temizle."""
         self.summary = None
+        self.summary_key = None
         self.sim_result = None
+        self.sim_scenario = None
         self.sim_key = None
+        self.sim_cmp = None
+        self.sim_jobs = None
+        self.sim_transfers = []     # iş numaraları yeni veride değişebilir: senaryo sıfırlanır
+        self._sim_machine_chosen = False
         self.load_table.clear()
         self.load_chart.message("Gösterilecek veri yok.")
         self.sim_table.clear()
-        self.sim_chart.message("Makine, hedef ve oranı seçip 'Simüle Et'e basın.")
+        self.sim_jobs_table.clear()
+        self.sim_list_table.clear()
+        self._on_job_select()
+        self.sim_summary.configure(text=self.SIM_HINT, text_color="#555")
+        self.sim_chart.message("Senaryoya aktarım ekleyince sonuç burada görünür.")
         self.period_weeks = {}
         self.period_combo.configure(values=[ALL_PERIOD])
         self.period_combo.set(ALL_PERIOD)
@@ -1021,9 +1547,11 @@ class App(ctk.CTk):
         if self.sim_result is not None:
             if getattr(self, "sim_key", None) == self._sim_key(months):
                 extra = {"Simülasyon": self.sim_result}
+                if self.sim_scenario is not None:
+                    extra["Simülasyon_Senaryo"] = self.sim_scenario
             else:
                 note = ("\n\nNot: son simülasyon farklı ay / kapasite ile yapıldığı için rapora eklenmedi. "
-                        "Rapora girmesi için 'Simüle Et'e tekrar basın.")
+                        "Rapora girmesi için Simülasyon sekmesinde 'Yeniden Hesapla'ya basın.")
         try:
             self.engine.export_to_excel(path, months, caps, default_cap, extra_sheets=extra)
         except PermissionError:
@@ -1456,6 +1984,30 @@ class OrdersWindow(ctk.CTkToplevel):
                      f"{n_del} silme – 'Kaydet' demeden hesaba yansımaz")
         self.label.configure(text=info, text_color=COLOR_OVER if self.changes else "#333")
 
+    @property
+    def firms(self):
+        vals = set(self.base["firma"].dropna()) | {c["firma"] for c in self.changes.values()}
+        return sorted(v for v in vals if v)
+
+    def week_month_in_db(self, yil, hafta, ay):
+        """Bu yılın bu haftası veritabanında başka bir aya kayıtlıysa (ay, yil) döner, değilse None."""
+        df = self.base
+        wy = hafta_yili(int(yil), AY_ADLARI.index(ay) + 1, int(hafta))
+        m = (pd.to_numeric(df["hafta"]) == int(hafta)) & (pd.to_numeric(df["hafta_yili"], errors="coerce") == wy)
+        found = df.loc[m, ["ay", "yil"]].drop_duplicates()
+        found = found[~((found["ay"] == ay) & (found["yil"].astype(int) == int(yil)))]
+        if found.empty:
+            return None
+        r = found.iloc[0]
+        return r["ay"], int(r["yil"])
+
+    def other_firms(self, rec):
+        """Aynı ürün + yıl + hafta için başka firma adıyla duran siparişler [(firma, adet), ...]."""
+        df = self._merged()
+        m = ((df["urun_kodu"] == rec["urun_kodu"]) & (df["yil"].astype(int) == int(rec["yil"])) &
+             (df["hafta"].astype(int) == int(rec["hafta"])) & (df["adet"] > 0) & (df["firma"] != rec["firma"]))
+        return list(zip(df.loc[m, "firma"], df.loc[m, "adet"]))
+
     def base_keys(self):
         return [order_key(*k) for k in zip(self.base["urun_kodu"], self.base["firma"], self.base["yil"], self.base["hafta"])]
 
@@ -1580,7 +2132,13 @@ class OrderDialog(ctk.CTkToplevel):
                   ("hafta", "Hafta (W) *"), ("adet", "Adet *")]
         for i, (k, label) in enumerate(fields):
             ctk.CTkLabel(f, text=label, anchor="w").grid(row=i, column=0, sticky="w", padx=8, pady=5)
-            w = ctk.CTkComboBox(f, values=AY_ADLARI, width=200) if k == "ay" else ctk.CTkEntry(f, width=200)
+            if k == "ay":
+                w = ctk.CTkComboBox(f, values=AY_ADLARI, width=200)
+            elif k == "firma":   # var olan firmalardan seç ya da yeni yaz
+                w = ctk.CTkComboBox(f, values=[""] + list(getattr(master, "firms", [])), width=200)
+                w.set("")
+            else:
+                w = ctk.CTkEntry(f, width=200)
             w.grid(row=i, column=1, padx=8, pady=5)
             val = rec.get(k, "")
             if k == "adet" and val != "":
@@ -1613,7 +2171,7 @@ class OrderDialog(ctk.CTkToplevel):
     def _ok(self):
         mb = _Parented(messagebox, self)
         g = lambda k: self.w[k].get().strip()
-        rec = {"urun_kodu": normalize_code(g("urun_kodu")), "firma": g("firma"), "ay": g("ay").upper()}
+        rec = {"urun_kodu": normalize_code(g("urun_kodu")), "firma": normalize_firma(g("firma")), "ay": g("ay").upper()}
         errors = []
         try:
             rec["yil"] = int(g("yil"))
@@ -1639,10 +2197,38 @@ class OrderDialog(ctk.CTkToplevel):
         if errors:
             mb.showwarning("Eksik / hatalı bilgi", "\n".join(errors))
             return
+        if rec["adet"] != int(rec["adet"]):
+            yazilan = g("adet")
+            okunan = f"{rec['adet']:g}".replace(".", ",")
+            if not mb.askyesno("Kesirli adet",
+                               f"'{yazilan}' yazdınız; bu {okunan} adet (kesirli) olarak okundu.\n\n"
+                               "Binlik ayırıcı için NOKTA kullanın: 1.500 = bin beş yüz, 1,5 = bir buçuk.\n\n"
+                               f"{okunan} adet olarak kaydedilsin mi?"):
+                return
         if not self.edit:
+            other = self.owner.week_month_in_db(rec["yil"], rec["hafta"], rec["ay"])
+            if other:
+                ans = mb.askyesnocancel(
+                    "Hafta başka ayda",
+                    f"W{rec['hafta']} haftası veritabanında {other[0]} {other[1]} ayında duruyor; "
+                    f"siz {rec['ay']} {rec['yil']} yazdınız.\n\nFarklı aya yazılırsa hesapta yine {other[0]} {other[1]} "
+                    "ayına sayılabilir.\n\n"
+                    f"EVET = ayı {other[0]} {other[1]} yap\nHAYIR = {rec['ay']} {rec['yil']} olarak bırak\nİPTAL = vazgeç")
+                if ans is None:
+                    return
+                if ans:
+                    rec["ay"], rec["yil"] = other
             ay_no = AY_ADLARI.index(rec["ay"]) + 1
             problem = week_month_problem(rec["hafta"], hafta_yili(rec["yil"], ay_no, rec["hafta"]), ay_no, rec["yil"])
             if problem and not mb.askyesno("Hafta – ay uyumu", problem + "\n\nYine de eklensin mi?"):
+                return
+            others = self.owner.other_firms(rec)
+            if others and not mb.askyesno(
+                    "Başka firmanın siparişi var",
+                    f"{rec['urun_kodu']} için {rec['ay']} {rec['yil']} W{rec['hafta']} haftasında şu firma(lar)ın "
+                    f"siparişi zaten var:\n" + "\n".join(f"  • {f or '(firma yok)'}: {fmt_num(a, 0)} adet" for f, a in others) +
+                    f"\n\n'{rec['firma'] or '(firma yok)'}' için AYRI, yeni bir sipariş olarak eklensin mi?\n"
+                    "(Aynı müşteriyse 'Hayır' deyip firmayı listeden seçin.)"):
                 return
             if self.owner.products and rec["urun_kodu"] not in self.owner.products:
                 if not mb.askyesno("Operasyon yok",
@@ -1851,7 +2437,9 @@ class ImportDialog(ctk.CTkToplevel):
         lines = [f"Dosya: {os.path.basename(path)}  /  Sayfa: {sheet}",
                  f"Ürün (ürün + firma): {plan.n_products}",
                  f"Sipariş satırı (adet > 0): {int((plan.orders['adet'] > 0).sum())}",
-                 f"Backlog/stok satırı: {len(plan.backlog)}  → {plan.blocks[0].ay} ayına yazılacak"]
+                 f"Backlog/stok satırı: {len(plan.backlog)}  → {plan.blocks[0].ay} ayına yazılacak",
+                 "Zararlı Excel'e karşı XML koruması: " + ("AÇIK" if XML_PROTECTED else
+                                                          "KAPALI (defusedxml kurulu değil – build_exe.bat'ı yeniden çalıştırın)")]
         if plan.warnings:
             lines += ["", "UYARILAR:"] + [f"• {w}" for w in plan.warnings[:30]]
         lines += ["", "Yılları kontrol edip 'Veritabanına Yaz'a basın."]
